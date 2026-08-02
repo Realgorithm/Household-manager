@@ -47,6 +47,30 @@ const UNITS = ["pcs", "kg", "gm", "ltr"];
 const UNIT_STEP = { pcs: 1, kg: 0.5, gm: 50, ltr: 0.5 };
 const round2 = (n) => Math.round(n * 100) / 100;
 
+// Nets out all peer-paid expenses into simplified "A owes B" debts.
+function computePeerDebts(tx) {
+  const pairs = {};
+  tx.filter(t => t.type === "peer").forEach(t => {
+    const share = t.amount / t.splitWith.length;
+    t.splitWith.forEach(ower => {
+      if (ower === t.payer) return;
+      const names = [ower, t.payer].sort();
+      const key = names.join("|");
+      if (!pairs[key]) pairs[key] = { names, net: 0 };
+      // net > 0 means names[0] owes names[1]; ower paying toward payer moves it that way
+      pairs[key].net += ower === names[0] ? share : -share;
+    });
+  });
+  return Object.values(pairs)
+    .map(p => {
+      if (Math.abs(p.net) < 0.01) return null;
+      return p.net > 0
+        ? { from: p.names[0], to: p.names[1], amount: round2(p.net) }
+        : { from: p.names[1], to: p.names[0], amount: round2(-p.net) };
+    })
+    .filter(Boolean);
+}
+
 const EXPENSE_CATEGORIES = [
   { name: "Groceries", color: "#4C8B5C", icon: ShoppingBasket },
   { name: "Rent", color: "#4A7FB5", icon: KeyRound },
@@ -214,7 +238,8 @@ export default function PantryLedger() {
     if (tab === "budget" && !canSeeBudget) setTab("pantry");
     if (tab === "people" && !canSeePeople) setTab("pantry");
     if (tab === "history" && !canSeeBudget) setTab("pantry");
-  }, [tab, canSeeBudget, canSeePeople]);
+    if (tab === "shopping" && !isAdmin) setTab("pantry");
+  }, [tab, canSeeBudget, canSeePeople, isAdmin]);
 
   if (!ready || !identityChecked) {
     return (
@@ -254,7 +279,7 @@ export default function PantryLedger() {
           canSeePeople={canSeePeople}
         />
         {tab === "pantry" && <PantryTab pantry={pantry} setPantry={persistPantry} isAdmin={isAdmin} logActivity={logActivity} />}
-        {tab === "shopping" && (
+        {tab === "shopping" && isAdmin && (
           <ShoppingTab pantry={pantry} setPantry={persistPantry} shoppingExtra={shoppingExtra} setShoppingExtra={persistShoppingExtra} actorLabel={actorLabel} logActivity={logActivity} />
         )}
         {tab === "budget" && canSeeBudget && (
@@ -289,15 +314,15 @@ function GlobalStyle() {
 }
 
 function Header({ lowStockCount, poolBalance, tab, setTab, identity, switchIdentity, canSeeBudget, canSeePeople }) {
+  const isAdmin = identity?.role === "admin";
   const tabs = [
     { id: "pantry", label: "Pantry", icon: Package, badge: lowStockCount, show: true },
-    { id: "shopping", label: "Shopping", icon: ShoppingCart, show: identity?.role === "admin" },
+    { id: "shopping", label: "Shopping", icon: ShoppingCart, show: isAdmin },
     { id: "budget", label: "Budget", icon: Wallet, show: canSeeBudget },
     { id: "history", label: "History", icon: Archive, show: canSeeBudget },
     { id: "people", label: "Household", icon: Users, show: canSeePeople },
     { id: "activity", label: "Activity", icon: ActivityIcon, show: true },
   ].filter(t => t.show);
-  const isAdmin = identity?.role === "admin";
   const label = isAdmin ? "Admin" : (identity?.name || "Housemate");
   return (
     <div className="mb-7">
@@ -316,23 +341,6 @@ function Header({ lowStockCount, poolBalance, tab, setTab, identity, switchIdent
           <div className="font-display" style={{ color: poolBalance < 0 ? "#C05C4A" : "#1F2A1D", fontSize: 20, fontWeight: 700 }}>
             {money(poolBalance)}
           </div>
-        </div>
-        <div
-          style={{
-            marginTop: "10px",
-            display: "inline-flex",
-            alignItems: "center",
-            gap: "6px",
-            padding: "6px 12px",
-            background: "#FFF7E6",
-            border: "1px solid #F5C26B",
-            borderRadius: "999px",
-            color: "#A66A00",
-            fontSize: "12px",
-            fontWeight: 600,
-          }}
-        >
-          🚧 🚀 New budget features coming soon
         </div>
       </div>
       <div className="flex items-center gap-2 mb-5">
@@ -465,9 +473,9 @@ function LoginScreen({ credentials, members, onLogin }) {
 
 function StatCard({ label, value, color }) {
   return (<div>
-    <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
-    <div className="font-display" style={{ color: color || "#1F2A1D", fontSize: 20, fontWeight: 700 }}>{value}</div>
-  </div>
+      <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
+      <div className="font-display" style={{ color: color || "#1F2A1D", fontSize: 20, fontWeight: 700 }}>{value}</div>
+    </div>
   );
 }
 
@@ -833,7 +841,7 @@ function ShoppingTab({ pantry, setPantry, shoppingExtra, setShoppingExtra, actor
 }
 
 function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContributed, totalSpent, isAdmin, closeMonth, logActivity }) {
-  const [form, setForm] = useState({ type: "expense", category: "Groceries", person: "", amount: "", note: "" });
+  const [form, setForm] = useState({ type: "expense", category: "Groceries", paidBy: "pool", person: "", contribPaidBy: "", amount: "", note: "" });
   const [splitWith, setSplitWith] = useState([]);
   const [confirmClose, setConfirmClose] = useState(false);
   const monthLabel = new Date().toLocaleDateString(undefined, { month: "long", year: "numeric" });
@@ -850,6 +858,49 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
     const amt = Number(form.amount);
     if (!amt || amt <= 0) return;
     if (form.type === "contribution" && !form.person) return;
+
+    // A contribution credited to one person's target, but the cash actually
+    // came from someone else — the pool sees it as paid, and the covered
+    // person owes the payer directly (shows up in Who owes whom).
+    if (form.type === "contribution") {
+      const payer = form.contribPaidBy || form.person;
+      const entries = [{
+        id: uid(), type: "contribution", category: null, person: form.person,
+        amount: amt, note: form.note, date: new Date().toISOString(),
+      }];
+      if (payer !== form.person) {
+        entries.push({
+          id: uid(), type: "peer", category: "Other", payer,
+          splitWith: [form.person], amount: amt, note: form.note || "Covered contribution",
+          date: new Date().toISOString(),
+        });
+      }
+      setTx([...entries, ...tx]);
+      logActivity?.(
+        payer !== form.person
+          ? `logged ${money(amt)} contribution for ${form.person}, covered by ${payer}`
+          : `logged ${money(amt)} contribution from ${form.person}`,
+        "budget"
+      );
+      setForm({ ...form, amount: "", note: "", contribPaidBy: "" });
+      return;
+    }
+
+    // Paid personally by someone (not the shared pool) — creates a direct
+    // debt from each split housemate to whoever paid, tracked separately
+    // from the pool balance and monthly targets.
+    if (form.type === "expense" && form.paidBy !== "pool") {
+      if (splitWith.length === 0) return;
+      const splitNames = members.filter(m => splitWith.includes(m.id)).map(m => m.name);
+      setTx([{
+        id: uid(), type: "peer", category: form.category, payer: form.paidBy,
+        splitWith: splitNames, amount: amt, note: form.note, date: new Date().toISOString(),
+      }, ...tx]);
+      logActivity?.(`${form.paidBy} paid ${money(amt)} (${form.category}) for ${splitNames.join(", ")}`, "budget");
+      setForm({ ...form, amount: "", note: "" });
+      setSplitWith([]);
+      return;
+    }
 
     let splitNames = null;
     if (form.type === "expense" && splitWith.length > 0) {
@@ -874,13 +925,20 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
   };
   const removeTx = (t) => {
     setTx(tx.filter(x => x.id !== t.id));
-    logActivity?.(`deleted a ${money(t.amount)} ${t.type === "expense" ? (t.category || "expense") : "contribution"} entry`, "budget");
+    logActivity?.(`deleted a ${money(t.amount)} ${t.type === "expense" ? (t.category || "expense") : t.type === "peer" ? `payment by ${t.payer}` : "contribution"} entry`, "budget");
   };
   const settleUp = (member) => {
     const remaining = round2(member.contribution - tx.filter(t => t.type === "contribution" && t.person === member.name).reduce((s, t) => s + t.amount, 0));
     if (remaining <= 0) return;
     setTx([{ id: uid(), type: "contribution", category: null, person: member.name, amount: remaining, note: "Settled up", date: new Date().toISOString() }, ...tx]);
     logActivity?.(`settled up ${member.name}'s ${money(remaining)} balance`, "budget");
+  };
+  const settlePeerDebt = (debt) => {
+    setTx([{
+      id: uid(), type: "peer", category: "Other", payer: debt.to,
+      splitWith: [debt.from], amount: debt.amount, note: "Settled up", date: new Date().toISOString(),
+    }, ...tx]);
+    logActivity?.(`settled: ${debt.from} paid ${debt.to} back ${money(debt.amount)}`, "budget");
   };
 
   const spendByCategory = EXPENSE_CATEGORIES.map(c => ({
@@ -892,6 +950,8 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
     const contributed = tx.filter(t => t.type === "contribution" && t.person === m.name).reduce((s, t) => s + t.amount, 0);
     return { ...m, contributed, remaining: round2(m.contribution - contributed) };
   }).sort((a, b) => b.remaining - a.remaining);
+
+  const peerDebts = computePeerDebts(tx);
 
   return (
     <div>
@@ -938,90 +998,174 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
       ) : (
         <>
           {isAdmin ? (
-            <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
-              <div className="flex gap-2 mb-3">
-                {["expense", "contribution"].map(t => (
+          <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+            <div className="flex gap-2 mb-3">
+              {["expense", "contribution"].map(t => (
+                <button
+                  key={t}
+                  onClick={() => setForm({ ...form, type: t })}
+                  className="px-3 py-1.5"
+                  style={{
+                    background: form.type === t ? (t === "expense" ? "#C05C4A" : "#4C8B5C") : "#F7F8F5",
+                    color: form.type === t ? "#fff" : "#4A5247",
+                    border: "1px solid " + (form.type === t ? "transparent" : "#E7E9E2"),
+                    borderRadius: 8, fontSize: 12.5, fontWeight: 600,
+                  }}
+                >
+                  {t === "expense" ? "Expense" : "Contribution"}
+                </button>
+              ))}
+            </div>
+            {form.type === "expense" && (
+              <div className="flex gap-1.5 mb-3 flex-wrap">
+                {EXPENSE_CATEGORIES.map(c => {
+                  const Icon = c.icon;
+                  const active = form.category === c.name;
+                  return (
+                    <button
+                      key={c.name}
+                      onClick={() => setForm({ ...form, category: c.name })}
+                      className="flex items-center gap-1 px-2.5 py-1.5"
+                      style={{
+                        background: active ? c.color + "1A" : "#F7F8F5",
+                        color: active ? c.color : "#8A9186",
+                        border: `1px solid ${active ? c.color : "#E7E9E2"}`,
+                        borderRadius: 8, fontSize: 12, fontWeight: 600,
+                      }}
+                    >
+                      <Icon size={12} /> {c.name}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {form.type === "expense" && (
+              <div className="mb-3">
+                <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 6 }}>Who paid?</div>
+                <div className="flex gap-1.5 flex-wrap">
                   <button
-                    key={t}
-                    onClick={() => setForm({ ...form, type: t })}
-                    className="px-3 py-1.5"
+                    onClick={() => setForm({ ...form, paidBy: "pool" })}
+                    className="px-2.5 py-1.5"
                     style={{
-                      background: form.type === t ? (t === "expense" ? "#C05C4A" : "#4C8B5C") : "#F7F8F5",
-                      color: form.type === t ? "#fff" : "#4A5247",
-                      border: "1px solid " + (form.type === t ? "transparent" : "#E7E9E2"),
-                      borderRadius: 8, fontSize: 12.5, fontWeight: 600,
+                      background: form.paidBy === "pool" ? "#1F2A1D" : "#F7F8F5",
+                      color: form.paidBy === "pool" ? "#fff" : "#4A5247",
+                      border: `1px solid ${form.paidBy === "pool" ? "#1F2A1D" : "#E7E9E2"}`,
+                      borderRadius: 8, fontSize: 12, fontWeight: 600,
                     }}
                   >
-                    {t === "expense" ? "Expense" : "Contribution"}
+                    Household pool
                   </button>
-                ))}
-              </div>
-              {form.type === "expense" && (
-                <div className="flex gap-1.5 mb-3 flex-wrap">
-                  {EXPENSE_CATEGORIES.map(c => {
-                    const Icon = c.icon;
-                    const active = form.category === c.name;
+                  {members.map(m => {
+                    const active = form.paidBy === m.name;
                     return (
                       <button
-                        key={c.name}
-                        onClick={() => setForm({ ...form, category: c.name })}
-                        className="flex items-center gap-1 px-2.5 py-1.5"
+                        key={m.id}
+                        onClick={() => setForm({ ...form, paidBy: m.name })}
+                        className="px-2.5 py-1.5"
                         style={{
-                          background: active ? c.color + "1A" : "#F7F8F5",
-                          color: active ? c.color : "#8A9186",
-                          border: `1px solid ${active ? c.color : "#E7E9E2"}`,
+                          background: active ? "#4A7FB5" : "#F7F8F5",
+                          color: active ? "#fff" : "#4A5247",
+                          border: `1px solid ${active ? "#4A7FB5" : "#E7E9E2"}`,
                           borderRadius: 8, fontSize: 12, fontWeight: 600,
                         }}
                       >
-                        <Icon size={12} /> {c.name}
+                        {m.name} (personally)
                       </button>
                     );
                   })}
                 </div>
-              )}
-              {form.type === "expense" && (
-                <div className="mb-3">
-                  <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 6 }}>Split with specific housemates? (optional — adds their share to their monthly target)</div>
-                  <div className="flex gap-1.5 flex-wrap">
-                    {members.map(m => {
-                      const active = splitWith.includes(m.id);
-                      return (
-                        <button
-                          key={m.id}
-                          onClick={() => toggleSplit(m.id)}
-                          className="px-2.5 py-1.5"
-                          style={{
-                            background: active ? "#1F2A1D" : "#F7F8F5",
-                            color: active ? "#fff" : "#4A5247",
-                            border: `1px solid ${active ? "#1F2A1D" : "#E7E9E2"}`,
-                            borderRadius: 8, fontSize: 12, fontWeight: 600,
-                          }}
-                        >
-                          {m.name}
-                        </button>
-                      );
-                    })}
-                  </div>
-                  {splitWith.length > 0 && Number(form.amount) > 0 && (
-                    <div style={{ color: "#4C8B5C", fontSize: 11.5, marginTop: 6, fontWeight: 600 }}>
-                      → {money(Number(form.amount) / splitWith.length)} added to each of {splitWith.length} housemate{splitWith.length > 1 ? "s'" : "'s"} target
-                    </div>
-                  )}
-                </div>
-              )}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                {form.type === "contribution" && (
-                  <FieldSelect value={form.person} onChange={e => setForm({ ...form, person: e.target.value })}>
-                    {members.map(m => <option key={m.id} value={m.name}>{m.name}</option>)}
-                  </FieldSelect>
-                )}
-                <FieldInput type="number" min="0" step="0.01" placeholder="Amount" value={form.amount} onChange={e => setForm({ ...form, amount: e.target.value })} className={form.type === "expense" ? "col-span-2 sm:col-span-1" : ""} />
-                <FieldInput className="col-span-2 sm:col-span-1" placeholder={form.type === "expense" ? "Note (e.g. Costco run)" : "Note (optional)"} value={form.note} onChange={e => setForm({ ...form, note: e.target.value })} />
-                <button onClick={addTx} className="px-3 py-2" style={{ background: "#1F2A1D", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
-                  Log it
-                </button>
               </div>
+            )}
+            {form.type === "expense" && (
+              <div className="mb-3">
+                <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 6 }}>
+                  {form.paidBy === "pool"
+                    ? "Split with specific housemates? (optional — adds their share to their monthly target)"
+                    : `Who does this cover? (they'll owe ${form.paidBy || "the payer"} directly)`}
+                </div>
+                <div className="flex gap-1.5 flex-wrap">
+                  {members.map(m => {
+                    const active = splitWith.includes(m.id);
+                    return (
+                      <button
+                        key={m.id}
+                        onClick={() => toggleSplit(m.id)}
+                        className="px-2.5 py-1.5"
+                        style={{
+                          background: active ? "#1F2A1D" : "#F7F8F5",
+                          color: active ? "#fff" : "#4A5247",
+                          border: `1px solid ${active ? "#1F2A1D" : "#E7E9E2"}`,
+                          borderRadius: 8, fontSize: 12, fontWeight: 600,
+                        }}
+                      >
+                        {m.name}
+                      </button>
+                    );
+                  })}
+                </div>
+                {splitWith.length > 0 && Number(form.amount) > 0 && (
+                  <div style={{ color: form.paidBy === "pool" ? "#4C8B5C" : "#4A7FB5", fontSize: 11.5, marginTop: 6, fontWeight: 600 }}>
+                    {form.paidBy === "pool"
+                      ? `→ ${money(Number(form.amount) / splitWith.length)} added to each of ${splitWith.length} housemate${splitWith.length > 1 ? "s'" : "'s"} target`
+                      : `→ each owes ${form.paidBy} ${money(Number(form.amount) / splitWith.length)}`}
+                  </div>
+                )}
+              </div>
+            )}
+            {form.type === "contribution" && (
+              <div className="mb-3">
+                <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 6 }}>For</div>
+                <FieldSelect value={form.person} onChange={e => setForm({ ...form, person: e.target.value })} style={{ marginBottom: 8, width: "100%" }}>
+                  {members.map(m => <option key={m.id} value={m.name}>{m.name}</option>)}
+                </FieldSelect>
+                <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 6 }}>Actually paid by (optional — if someone covered it for them)</div>
+                <div className="flex gap-1.5 flex-wrap">
+                  <button
+                    onClick={() => setForm({ ...form, contribPaidBy: "" })}
+                    className="px-2.5 py-1.5"
+                    style={{
+                      background: !form.contribPaidBy ? "#1F2A1D" : "#F7F8F5",
+                      color: !form.contribPaidBy ? "#fff" : "#4A5247",
+                      border: `1px solid ${!form.contribPaidBy ? "#1F2A1D" : "#E7E9E2"}`,
+                      borderRadius: 8, fontSize: 12, fontWeight: 600,
+                    }}
+                  >
+                    {form.person || "Same person"}
+                  </button>
+                  {members.filter(m => m.name !== form.person).map(m => {
+                    const active = form.contribPaidBy === m.name;
+                    return (
+                      <button
+                        key={m.id}
+                        onClick={() => setForm({ ...form, contribPaidBy: m.name })}
+                        className="px-2.5 py-1.5"
+                        style={{
+                          background: active ? "#4A7FB5" : "#F7F8F5",
+                          color: active ? "#fff" : "#4A5247",
+                          border: `1px solid ${active ? "#4A7FB5" : "#E7E9E2"}`,
+                          borderRadius: 8, fontSize: 12, fontWeight: 600,
+                        }}
+                      >
+                        {m.name}
+                      </button>
+                    );
+                  })}
+                </div>
+                {form.contribPaidBy && form.contribPaidBy !== form.person && Number(form.amount) > 0 && (
+                  <div style={{ color: "#4A7FB5", fontSize: 11.5, marginTop: 6, fontWeight: 600 }}>
+                    → {form.person}'s target is marked paid, and they'll owe {form.contribPaidBy} {money(Number(form.amount))}
+                  </div>
+                )}
+              </div>
+            )}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <FieldInput type="number" min="0" step="0.01" placeholder="Amount" value={form.amount} onChange={e => setForm({ ...form, amount: e.target.value })} className={form.type === "expense" ? "col-span-2 sm:col-span-1" : "col-span-2 sm:col-span-3"} />
+              <FieldInput className="col-span-2 sm:col-span-1" placeholder={form.type === "expense" ? "Note (e.g. Costco run)" : "Note (optional)"} value={form.note} onChange={e => setForm({ ...form, note: e.target.value })} />
+              <button onClick={addTx} className="px-3 py-2" style={{ background: "#1F2A1D", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
+                Log it
+              </button>
             </div>
+          </div>
           ) : (
             <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, color: "#8A9186", fontSize: 13 }}>
               Only the house admin can log contributions and expenses. You can view balances and the ledger below.
@@ -1053,6 +1197,30 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
         </>
       )}
 
+      {peerDebts.length > 0 && (
+        <>
+          <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Who owes whom</div>
+          <div className="flex flex-col gap-2 mb-7">
+            {peerDebts.map((d, i) => (
+              <div key={i} className="card-hover flex items-center gap-3" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 12, padding: "10px 14px", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+                <div style={{ width: 28, height: 28, borderRadius: 8, background: "#4A7FB51A", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <HandCoins size={14} color="#4A7FB5" />
+                </div>
+                <div style={{ flex: 1, fontSize: 13, color: "#1F2A1D" }}>
+                  <span style={{ fontWeight: 700 }}>{d.from}</span> owes <span style={{ fontWeight: 700 }}>{d.to}</span>
+                </div>
+                <div className="font-mono" style={{ color: "#4A7FB5", fontSize: 13.5, fontWeight: 700 }}>{money(d.amount)}</div>
+                {isAdmin && (
+                  <button onClick={() => settlePeerDebt(d)} className="px-2.5 py-1" style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", color: "#4A5247", borderRadius: 7, fontSize: 11, fontWeight: 600 }}>
+                    Settle
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
       {spendByCategory.length > 0 && (
         <>
           <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Spending by category</div>
@@ -1077,9 +1245,9 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
         {tx.length === 0 && <EmptyState icon={Wallet} text="No entries yet." />}
         {tx.map(t => {
-          const cat = t.type === "expense" ? expCatInfo(t.category || "Other") : null;
+          const cat = (t.type === "expense" || t.type === "peer") ? expCatInfo(t.category || "Other") : null;
           const CatIcon = cat ? cat.icon : ArrowDownRight;
-          const iconColor = t.type === "expense" ? cat.color : "#4C8B5C";
+          const iconColor = t.type === "expense" ? cat.color : t.type === "peer" ? "#4A7FB5" : "#4C8B5C";
           return (
             <div key={t.id} className="card-hover flex items-center gap-3" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 12, padding: "10px 12px", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
               <div style={{ width: 28, height: 28, borderRadius: 8, background: iconColor + "1A", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
@@ -1087,14 +1255,16 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
               </div>
               <div className="flex-1 min-w-0">
                 <div style={{ color: "#1F2A1D", fontSize: 13, fontWeight: 500 }}>
-                  {t.type === "expense" ? <>Household <span style={{ color: "#8A9186", fontWeight: 400 }}>· {cat.name}</span></> : `${t.person} contributed`}
+                  {t.type === "expense" ? <>Household <span style={{ color: "#8A9186", fontWeight: 400 }}>· {cat.name}</span></>
+                    : t.type === "peer" ? <>{t.payer} paid <span style={{ color: "#8A9186", fontWeight: 400 }}>· {cat?.name}</span></>
+                    : `${t.person} contributed`}
                 </div>
                 <div style={{ color: "#B4BAAD", fontSize: 11 }}>
-                  {t.note ? `${t.note} · ` : ""}{t.splitWith ? `split with ${t.splitWith.join(", ")} · ` : ""}{new Date(t.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                  {t.note ? `${t.note} · ` : ""}{t.splitWith ? `${t.type === "peer" ? "owed by" : "split with"} ${t.splitWith.join(", ")} · ` : ""}{new Date(t.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
                 </div>
               </div>
-              <div className="font-display" style={{ color: t.type === "expense" ? "#C05C4A" : "#4C8B5C", fontSize: 13, fontWeight: 700 }}>
-                {t.type === "expense" ? "-" : "+"}{money(t.amount)}
+              <div className="font-display" style={{ color: t.type === "expense" ? "#C05C4A" : t.type === "peer" ? "#4A7FB5" : "#4C8B5C", fontSize: 13, fontWeight: 700 }}>
+                {t.type === "expense" ? "-" : t.type === "peer" ? "" : "+"}{money(t.amount)}
               </div>
               <button onClick={() => removeTx(t)} style={{ color: "#C6CBC0", padding: 3, visibility: isAdmin ? "visible" : "hidden" }}>
                 <Trash2 size={12} />
@@ -1161,11 +1331,13 @@ function HistoryTab({ history }) {
                   {rec.tx.map(t => (
                     <div key={t.id} className="flex items-center justify-between" style={{ fontSize: 12, padding: "5px 0", borderBottom: "1px solid #F5F6F2" }}>
                       <span style={{ color: "#4A5247" }}>
-                        {t.type === "expense" ? `Household · ${t.category || "Other"}` : `${t.person} contributed`}
+                        {t.type === "expense" ? `Household · ${t.category || "Other"}`
+                          : t.type === "peer" ? `${t.payer} paid for ${(t.splitWith || []).join(", ")}`
+                          : `${t.person} contributed`}
                         {t.note && <span style={{ color: "#B4BAAD" }}> — {t.note}</span>}
                       </span>
-                      <span className="font-mono" style={{ color: t.type === "expense" ? "#C05C4A" : "#4C8B5C", fontWeight: 600 }}>
-                        {t.type === "expense" ? "-" : "+"}{money(t.amount)}
+                      <span className="font-mono" style={{ color: t.type === "expense" ? "#C05C4A" : t.type === "peer" ? "#4A7FB5" : "#4C8B5C", fontWeight: 600 }}>
+                        {t.type === "expense" ? "-" : t.type === "peer" ? "" : "+"}{money(t.amount)}
                       </span>
                     </div>
                   ))}
@@ -1260,15 +1432,15 @@ function PeopleTab({ members, setMembers, tx, isAdmin, permissions, setPermissio
   return (
     <div>
       {isAdmin ? (
-        <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-            <FieldInput className="col-span-2 sm:col-span-1" placeholder="Name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
-            <FieldInput type="number" min="0" placeholder="Monthly target ($)" value={form.contribution} onChange={e => setForm({ ...form, contribution: e.target.value })} />
-            <button onClick={addMember} className="px-3 py-2" style={{ background: "#4C8B5C", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
-              Add housemate
-            </button>
-          </div>
+      <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          <FieldInput className="col-span-2 sm:col-span-1" placeholder="Name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
+          <FieldInput type="number" min="0" placeholder="Monthly target ($)" value={form.contribution} onChange={e => setForm({ ...form, contribution: e.target.value })} />
+          <button onClick={addMember} className="px-3 py-2" style={{ background: "#4C8B5C", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
+            Add housemate
+          </button>
         </div>
+      </div>
       ) : (
         <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, color: "#8A9186", fontSize: 13 }}>
           Only the house admin can add housemates or change contribution targets.
