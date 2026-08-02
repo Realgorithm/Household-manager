@@ -291,7 +291,7 @@ function GlobalStyle() {
 function Header({ lowStockCount, poolBalance, tab, setTab, identity, switchIdentity, canSeeBudget, canSeePeople }) {
   const tabs = [
     { id: "pantry", label: "Pantry", icon: Package, badge: lowStockCount, show: true },
-    { id: "shopping", label: "Shopping", icon: ShoppingCart, show: true },
+    { id: "shopping", label: "Shopping", icon: ShoppingCart, show: isAdmin },
     { id: "budget", label: "Budget", icon: Wallet, show: canSeeBudget },
     { id: "history", label: "History", icon: Archive, show: canSeeBudget },
     { id: "people", label: "Household", icon: Users, show: canSeePeople },
@@ -317,6 +317,7 @@ function Header({ lowStockCount, poolBalance, tab, setTab, identity, switchIdent
             {money(poolBalance)}
           </div>
         </div>
+        <div style={{color: "#8a9186", border: "1px solid #E7e9e2", borderRadius: 14, background:"#4c8b5c"}} >Update coming soon</div>
       </div>
       <div className="flex items-center gap-2 mb-5">
         <span style={{ background: isAdmin ? "#1F2A1D" : "#EDEFEA", color: isAdmin ? "#F7F8F5" : "#4A5247", fontSize: 11, fontWeight: 700, borderRadius: 7, padding: "3px 8px" }}>
