@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { Plus, Minus, Trash2, X, Package, Wallet, Users, AlertTriangle, ArrowUpRight, ArrowDownRight, Sprout, Milk, Beef, Snowflake, Home, ShoppingBasket, Sparkles, KeyRound, MoreHorizontal } from "lucide-react";
+import { Plus, Minus, Trash2, X, Package, Wallet, Users, AlertTriangle, ArrowUpRight, ArrowDownRight, Sprout, Milk, Beef, Snowflake, Home, ShoppingBasket, Sparkles, KeyRound, MoreHorizontal, Search, Pencil, Check } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
 // ---- storage helpers ---------------------------------------------------
@@ -39,6 +39,10 @@ const CATEGORIES = [
   { name: "Household", color: "#8D6CB0", icon: Home },
 ];
 const catInfo = (name) => CATEGORIES.find(c => c.name === name) || CATEGORIES[4];
+
+const UNITS = ["pcs", "kg", "gm", "ltr"];
+const UNIT_STEP = { pcs: 1, kg: 0.5, gm: 50, ltr: 0.5 };
+const round2 = (n) => Math.round(n * 100) / 100;
 
 const EXPENSE_CATEGORIES = [
   { name: "Groceries", color: "#4C8B5C", icon: ShoppingBasket },
@@ -423,6 +427,10 @@ function FieldSelect(props) {
 function PantryTab({ pantry, setPantry, isAdmin }) {
   const [form, setForm] = useState({ name: "", category: CATEGORIES[0].name, qty: 1, unit: "pcs", lowThreshold: 1 });
   const [adding, setAdding] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState(null);
+  const [search, setSearch] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("All");
 
   const addItem = () => {
     if (!form.name.trim()) return;
@@ -430,12 +438,112 @@ function PantryTab({ pantry, setPantry, isAdmin }) {
     setForm({ name: "", category: CATEGORIES[0].name, qty: 1, unit: "pcs", lowThreshold: 1 });
     setAdding(false);
   };
-  const adjustQty = (id, delta) => setPantry(pantry.map(i => i.id === id ? { ...i, qty: Math.max(0, i.qty + delta) } : i));
+  const adjustQty = (item, dir) => {
+    const step = UNIT_STEP[item.unit] || 1;
+    setPantry(pantry.map(i => i.id === item.id ? { ...i, qty: Math.max(0, round2(i.qty + dir * step)) } : i));
+  };
   const removeItem = (id) => setPantry(pantry.filter(i => i.id !== id));
+
+  const startEdit = (item) => { setEditingId(item.id); setEditForm({ ...item }); };
+  const cancelEdit = () => { setEditingId(null); setEditForm(null); };
+  const saveEdit = () => {
+    if (!editForm.name.trim()) return;
+    setPantry(pantry.map(i => i.id === editingId ? { ...editForm, qty: Number(editForm.qty), lowThreshold: Number(editForm.lowThreshold) } : i));
+    cancelEdit();
+  };
+
+  const q = search.trim().toLowerCase();
+  const filtered = pantry.filter(i =>
+    (categoryFilter === "All" || i.category === categoryFilter) &&
+    (!q || i.name.toLowerCase().includes(q))
+  );
+  const lowItems = [...filtered.filter(i => i.qty <= i.lowThreshold)].sort((a, b) => (a.qty - a.lowThreshold) - (b.qty - b.lowThreshold));
+  const grouped = CATEGORIES.map(c => ({ cat: c.name, items: filtered.filter(i => i.category === c.name) })).filter(g => g.items.length > 0);
+  const usedCategories = [...new Set(pantry.map(i => i.category))];
+
+  const renderCard = (item) => {
+    const cat = catInfo(item.category);
+    const Icon = cat.icon;
+    const low = item.qty <= item.lowThreshold;
+    const editing = editingId === item.id;
+
+    if (editing) {
+      return (
+        <div key={item.id} style={{ background: "#FFFFFF", border: "1px solid #4C8B5C", borderRadius: 14, overflow: "hidden", boxShadow: "0 2px 8px rgba(31,42,29,0.06)" }}>
+          <div style={{ height: 5, background: cat.color }} />
+          <div style={{ padding: "12px 14px" }} className="flex flex-col gap-1.5">
+            <FieldInput value={editForm.name} onChange={e => setEditForm({ ...editForm, name: e.target.value })} style={{ fontSize: 13 }} />
+            <FieldSelect value={editForm.category} onChange={e => setEditForm({ ...editForm, category: e.target.value })} style={{ fontSize: 12 }}>
+              {CATEGORIES.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
+            </FieldSelect>
+            <div className="flex gap-1.5">
+              <FieldInput type="number" min="0" step="any" value={editForm.qty} onChange={e => setEditForm({ ...editForm, qty: e.target.value })} style={{ fontSize: 12, flex: 1 }} />
+              <FieldSelect value={editForm.unit} onChange={e => setEditForm({ ...editForm, unit: e.target.value })} style={{ fontSize: 12, flex: 1 }}>
+                {UNITS.map(u => <option key={u} value={u}>{u}</option>)}
+              </FieldSelect>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <label style={{ color: "#8A9186", fontSize: 11 }}>Alert below</label>
+              <FieldInput type="number" min="0" step="any" className="w-16" value={editForm.lowThreshold} onChange={e => setEditForm({ ...editForm, lowThreshold: e.target.value })} style={{ fontSize: 12 }} />
+            </div>
+            <div className="flex gap-1.5 mt-1">
+              <button onClick={saveEdit} className="flex-1 flex items-center justify-center gap-1" style={{ background: "#4C8B5C", color: "#fff", borderRadius: 8, padding: "6px 0", fontSize: 12, fontWeight: 600 }}>
+                <Check size={12} /> Save
+              </button>
+              <button onClick={cancelEdit} style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", color: "#4A5247", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 600 }}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div key={item.id} className="card-hover" style={{ background: "#FFFFFF", border: `1px solid ${low ? "#F0C4B8" : "#E7E9E2"}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+        <div style={{ height: 5, background: cat.color }} />
+        <div style={{ padding: "12px 14px" }}>
+          <div className="flex items-start justify-between mb-2">
+            <div style={{ width: 30, height: 30, borderRadius: 8, background: cat.color + "1A", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <Icon size={15} color={cat.color} />
+            </div>
+            {isAdmin && (
+              <div className="flex items-center gap-0.5">
+                <button onClick={() => startEdit(item)} style={{ color: "#B4BAAD", padding: 2 }}>
+                  <Pencil size={12} />
+                </button>
+                <button onClick={() => removeItem(item.id)} style={{ color: "#C6CBC0", padding: 2 }}>
+                  <Trash2 size={13} />
+                </button>
+              </div>
+            )}
+          </div>
+          <div style={{ color: "#1F2A1D", fontSize: 14, fontWeight: 600, marginBottom: 1 }}>{item.name}</div>
+          <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 10 }}>{item.category}</div>
+          {low && (
+            <div className="flex items-center gap-1 mb-2" style={{ color: "#C05C4A", fontSize: 11, fontWeight: 600 }}>
+              <AlertTriangle size={11} /> {item.qty === 0 ? "Out of stock" : "Running low"}
+            </div>
+          )}
+          <div className="flex items-center justify-between">
+            <button onClick={() => adjustQty(item, -1)} style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", borderRadius: 7, padding: 5 }}>
+              <Minus size={12} color="#4A5247" />
+            </button>
+            <span className="font-display" style={{ color: low ? "#C05C4A" : "#1F2A1D", fontSize: 14, fontWeight: 700 }}>
+              {item.qty} <span style={{ fontSize: 11, fontWeight: 500, color: "#8A9186" }}>{item.unit}</span>
+            </span>
+            <button onClick={() => adjustQty(item, 1)} style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", borderRadius: 7, padding: 5 }}>
+              <Plus size={12} color="#4A5247" />
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
         <div style={{ color: "#4A5247", fontSize: 13 }}>{pantry.length} item{pantry.length !== 1 ? "s" : ""} on the shelf</div>
         {isAdmin && (
           <button
@@ -449,6 +557,38 @@ function PantryTab({ pantry, setPantry, isAdmin }) {
         )}
       </div>
 
+      <div className="flex flex-col sm:flex-row gap-2 mb-4">
+        <div style={{ position: "relative", flex: 1 }}>
+          <Search size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "#B4BAAD" }} />
+          <FieldInput
+            placeholder="Search pantry…"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            style={{ width: "100%", paddingLeft: 30 }}
+          />
+        </div>
+        <div className="flex gap-1.5 flex-wrap">
+          {["All", ...usedCategories].map(c => {
+            const active = categoryFilter === c;
+            return (
+              <button
+                key={c}
+                onClick={() => setCategoryFilter(c)}
+                className="px-2.5 py-1.5"
+                style={{
+                  background: active ? "#1F2A1D" : "#FFFFFF",
+                  color: active ? "#fff" : "#4A5247",
+                  border: `1px solid ${active ? "#1F2A1D" : "#E7E9E2"}`,
+                  borderRadius: 8, fontSize: 11.5, fontWeight: 600, whiteSpace: "nowrap",
+                }}
+              >
+                {c}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       {adding && isAdmin && (
         <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
@@ -456,12 +596,14 @@ function PantryTab({ pantry, setPantry, isAdmin }) {
             <FieldSelect value={form.category} onChange={e => setForm({ ...form, category: e.target.value })}>
               {CATEGORIES.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
             </FieldSelect>
-            <FieldInput type="number" min="0" placeholder="Qty" value={form.qty} onChange={e => setForm({ ...form, qty: e.target.value })} />
-            <FieldInput placeholder="Unit" value={form.unit} onChange={e => setForm({ ...form, unit: e.target.value })} />
+            <FieldInput type="number" min="0" step="any" placeholder="Qty" value={form.qty} onChange={e => setForm({ ...form, qty: e.target.value })} />
+            <FieldSelect value={form.unit} onChange={e => setForm({ ...form, unit: e.target.value })}>
+              {UNITS.map(u => <option key={u} value={u}>{u}</option>)}
+            </FieldSelect>
           </div>
           <div className="flex items-center gap-2 mt-2.5">
             <label style={{ color: "#8A9186", fontSize: 12 }}>Alert when below</label>
-            <FieldInput type="number" min="0" className="w-16" value={form.lowThreshold} onChange={e => setForm({ ...form, lowThreshold: e.target.value })} />
+            <FieldInput type="number" min="0" step="any" className="w-16" value={form.lowThreshold} onChange={e => setForm({ ...form, lowThreshold: e.target.value })} />
             <button onClick={addItem} className="ml-auto px-4 py-2" style={{ background: "#1F2A1D", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
               Add to shelf
             </button>
@@ -469,49 +611,33 @@ function PantryTab({ pantry, setPantry, isAdmin }) {
         </div>
       )}
 
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-        {pantry.length === 0 && <EmptyState icon={Package} text="The shelf is empty — add your first item." />}
-        {pantry.map(item => {
-          const cat = catInfo(item.category);
-          const Icon = cat.icon;
-          const low = item.qty <= item.lowThreshold;
-          return (
-            <div key={item.id} className="card-hover" style={{ background: "#FFFFFF", border: `1px solid ${low ? "#F0C4B8" : "#E7E9E2"}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
-              <div style={{ height: 5, background: cat.color }} />
-              <div style={{ padding: "12px 14px" }}>
-                <div className="flex items-start justify-between mb-2">
-                  <div style={{ width: 30, height: 30, borderRadius: 8, background: cat.color + "1A", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                    <Icon size={15} color={cat.color} />
-                  </div>
-                  {isAdmin && (
-                    <button onClick={() => removeItem(item.id)} style={{ color: "#C6CBC0", padding: 2 }}>
-                      <Trash2 size={13} />
-                    </button>
-                  )}
-                </div>
-                <div style={{ color: "#1F2A1D", fontSize: 14, fontWeight: 600, marginBottom: 1 }}>{item.name}</div>
-                <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 10 }}>{item.category}</div>
-                {low && (
-                  <div className="flex items-center gap-1 mb-2" style={{ color: "#C05C4A", fontSize: 11, fontWeight: 600 }}>
-                    <AlertTriangle size={11} /> Running low
-                  </div>
-                )}
-                <div className="flex items-center justify-between">
-                  <button onClick={() => adjustQty(item.id, -1)} style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", borderRadius: 7, padding: 5 }}>
-                    <Minus size={12} color="#4A5247" />
-                  </button>
-                  <span className="font-display" style={{ color: low ? "#C05C4A" : "#1F2A1D", fontSize: 14, fontWeight: 700 }}>
-                    {item.qty} <span style={{ fontSize: 11, fontWeight: 500, color: "#8A9186" }}>{item.unit}</span>
-                  </span>
-                  <button onClick={() => adjustQty(item.id, 1)} style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", borderRadius: 7, padding: 5 }}>
-                    <Plus size={12} color="#4A5247" />
-                  </button>
-                </div>
+      {lowItems.length > 0 && (
+        <div className="mb-6">
+          <div className="flex items-center gap-1.5 mb-2" style={{ color: "#C05C4A", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5 }}>
+            <AlertTriangle size={12} /> Running low ({lowItems.length})
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+            {lowItems.map(renderCard)}
+          </div>
+        </div>
+      )}
+
+      {filtered.length === 0 ? (
+        <EmptyState icon={pantry.length === 0 ? Package : Search} text={pantry.length === 0 ? "The shelf is empty — add your first item." : "No items match your search."} />
+      ) : (
+        <div className="flex flex-col gap-6">
+          {grouped.map(({ cat, items }) => (
+            <div key={cat}>
+              <div className="font-mono mb-2" style={{ color: "rgba(31,42,29,0.35)", fontSize: 11, letterSpacing: 1.5, textTransform: "uppercase" }}>
+                {cat}
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+                {items.map(renderCard)}
               </div>
             </div>
-          );
-        })}
-      </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
