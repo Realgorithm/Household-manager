@@ -291,7 +291,7 @@ function GlobalStyle() {
 function Header({ lowStockCount, poolBalance, tab, setTab, identity, switchIdentity, canSeeBudget, canSeePeople }) {
   const tabs = [
     { id: "pantry", label: "Pantry", icon: Package, badge: lowStockCount, show: true },
-    { id: "shopping", label: "Shopping", icon: ShoppingCart, show: isAdmin },
+    { id: "shopping", label: "Shopping", icon: ShoppingCart, show: identity?.role === "admin" },
     { id: "budget", label: "Budget", icon: Wallet, show: canSeeBudget },
     { id: "history", label: "History", icon: Archive, show: canSeeBudget },
     { id: "people", label: "Household", icon: Users, show: canSeePeople },
@@ -317,7 +317,23 @@ function Header({ lowStockCount, poolBalance, tab, setTab, identity, switchIdent
             {money(poolBalance)}
           </div>
         </div>
-        <div style={{color: "#8a9186", border: "1px solid #E7e9e2", borderRadius: 14, background:"#4c8b5c"}} >Update coming soon</div>
+        <div
+          style={{
+            marginTop: "10px",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "6px",
+            padding: "6px 12px",
+            background: "#FFF7E6",
+            border: "1px solid #F5C26B",
+            borderRadius: "999px",
+            color: "#A66A00",
+            fontSize: "12px",
+            fontWeight: 600,
+          }}
+        >
+          🚧 🚀 New budget features coming soon
+        </div>
       </div>
       <div className="flex items-center gap-2 mb-5">
         <span style={{ background: isAdmin ? "#1F2A1D" : "#EDEFEA", color: isAdmin ? "#F7F8F5" : "#4A5247", fontSize: 11, fontWeight: 700, borderRadius: 7, padding: "3px 8px" }}>
@@ -449,9 +465,9 @@ function LoginScreen({ credentials, members, onLogin }) {
 
 function StatCard({ label, value, color }) {
   return (<div>
-      <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
-      <div className="font-display" style={{ color: color || "#1F2A1D", fontSize: 20, fontWeight: 700 }}>{value}</div>
-    </div>
+    <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
+    <div className="font-display" style={{ color: color || "#1F2A1D", fontSize: 20, fontWeight: 700 }}>{value}</div>
+  </div>
   );
 }
 
@@ -922,90 +938,90 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
       ) : (
         <>
           {isAdmin ? (
-          <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
-            <div className="flex gap-2 mb-3">
-              {["expense", "contribution"].map(t => (
-                <button
-                  key={t}
-                  onClick={() => setForm({ ...form, type: t })}
-                  className="px-3 py-1.5"
-                  style={{
-                    background: form.type === t ? (t === "expense" ? "#C05C4A" : "#4C8B5C") : "#F7F8F5",
-                    color: form.type === t ? "#fff" : "#4A5247",
-                    border: "1px solid " + (form.type === t ? "transparent" : "#E7E9E2"),
-                    borderRadius: 8, fontSize: 12.5, fontWeight: 600,
-                  }}
-                >
-                  {t === "expense" ? "Expense" : "Contribution"}
-                </button>
-              ))}
-            </div>
-            {form.type === "expense" && (
-              <div className="flex gap-1.5 mb-3 flex-wrap">
-                {EXPENSE_CATEGORIES.map(c => {
-                  const Icon = c.icon;
-                  const active = form.category === c.name;
-                  return (
-                    <button
-                      key={c.name}
-                      onClick={() => setForm({ ...form, category: c.name })}
-                      className="flex items-center gap-1 px-2.5 py-1.5"
-                      style={{
-                        background: active ? c.color + "1A" : "#F7F8F5",
-                        color: active ? c.color : "#8A9186",
-                        border: `1px solid ${active ? c.color : "#E7E9E2"}`,
-                        borderRadius: 8, fontSize: 12, fontWeight: 600,
-                      }}
-                    >
-                      <Icon size={12} /> {c.name}
-                    </button>
-                  );
-                })}
+            <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+              <div className="flex gap-2 mb-3">
+                {["expense", "contribution"].map(t => (
+                  <button
+                    key={t}
+                    onClick={() => setForm({ ...form, type: t })}
+                    className="px-3 py-1.5"
+                    style={{
+                      background: form.type === t ? (t === "expense" ? "#C05C4A" : "#4C8B5C") : "#F7F8F5",
+                      color: form.type === t ? "#fff" : "#4A5247",
+                      border: "1px solid " + (form.type === t ? "transparent" : "#E7E9E2"),
+                      borderRadius: 8, fontSize: 12.5, fontWeight: 600,
+                    }}
+                  >
+                    {t === "expense" ? "Expense" : "Contribution"}
+                  </button>
+                ))}
               </div>
-            )}
-            {form.type === "expense" && (
-              <div className="mb-3">
-                <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 6 }}>Split with specific housemates? (optional — adds their share to their monthly target)</div>
-                <div className="flex gap-1.5 flex-wrap">
-                  {members.map(m => {
-                    const active = splitWith.includes(m.id);
+              {form.type === "expense" && (
+                <div className="flex gap-1.5 mb-3 flex-wrap">
+                  {EXPENSE_CATEGORIES.map(c => {
+                    const Icon = c.icon;
+                    const active = form.category === c.name;
                     return (
                       <button
-                        key={m.id}
-                        onClick={() => toggleSplit(m.id)}
-                        className="px-2.5 py-1.5"
+                        key={c.name}
+                        onClick={() => setForm({ ...form, category: c.name })}
+                        className="flex items-center gap-1 px-2.5 py-1.5"
                         style={{
-                          background: active ? "#1F2A1D" : "#F7F8F5",
-                          color: active ? "#fff" : "#4A5247",
-                          border: `1px solid ${active ? "#1F2A1D" : "#E7E9E2"}`,
+                          background: active ? c.color + "1A" : "#F7F8F5",
+                          color: active ? c.color : "#8A9186",
+                          border: `1px solid ${active ? c.color : "#E7E9E2"}`,
                           borderRadius: 8, fontSize: 12, fontWeight: 600,
                         }}
                       >
-                        {m.name}
+                        <Icon size={12} /> {c.name}
                       </button>
                     );
                   })}
                 </div>
-                {splitWith.length > 0 && Number(form.amount) > 0 && (
-                  <div style={{ color: "#4C8B5C", fontSize: 11.5, marginTop: 6, fontWeight: 600 }}>
-                    → {money(Number(form.amount) / splitWith.length)} added to each of {splitWith.length} housemate{splitWith.length > 1 ? "s'" : "'s"} target
-                  </div>
-                )}
-              </div>
-            )}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              {form.type === "contribution" && (
-                <FieldSelect value={form.person} onChange={e => setForm({ ...form, person: e.target.value })}>
-                  {members.map(m => <option key={m.id} value={m.name}>{m.name}</option>)}
-                </FieldSelect>
               )}
-              <FieldInput type="number" min="0" step="0.01" placeholder="Amount" value={form.amount} onChange={e => setForm({ ...form, amount: e.target.value })} className={form.type === "expense" ? "col-span-2 sm:col-span-1" : ""} />
-              <FieldInput className="col-span-2 sm:col-span-1" placeholder={form.type === "expense" ? "Note (e.g. Costco run)" : "Note (optional)"} value={form.note} onChange={e => setForm({ ...form, note: e.target.value })} />
-              <button onClick={addTx} className="px-3 py-2" style={{ background: "#1F2A1D", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
-                Log it
-              </button>
+              {form.type === "expense" && (
+                <div className="mb-3">
+                  <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 6 }}>Split with specific housemates? (optional — adds their share to their monthly target)</div>
+                  <div className="flex gap-1.5 flex-wrap">
+                    {members.map(m => {
+                      const active = splitWith.includes(m.id);
+                      return (
+                        <button
+                          key={m.id}
+                          onClick={() => toggleSplit(m.id)}
+                          className="px-2.5 py-1.5"
+                          style={{
+                            background: active ? "#1F2A1D" : "#F7F8F5",
+                            color: active ? "#fff" : "#4A5247",
+                            border: `1px solid ${active ? "#1F2A1D" : "#E7E9E2"}`,
+                            borderRadius: 8, fontSize: 12, fontWeight: 600,
+                          }}
+                        >
+                          {m.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {splitWith.length > 0 && Number(form.amount) > 0 && (
+                    <div style={{ color: "#4C8B5C", fontSize: 11.5, marginTop: 6, fontWeight: 600 }}>
+                      → {money(Number(form.amount) / splitWith.length)} added to each of {splitWith.length} housemate{splitWith.length > 1 ? "s'" : "'s"} target
+                    </div>
+                  )}
+                </div>
+              )}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {form.type === "contribution" && (
+                  <FieldSelect value={form.person} onChange={e => setForm({ ...form, person: e.target.value })}>
+                    {members.map(m => <option key={m.id} value={m.name}>{m.name}</option>)}
+                  </FieldSelect>
+                )}
+                <FieldInput type="number" min="0" step="0.01" placeholder="Amount" value={form.amount} onChange={e => setForm({ ...form, amount: e.target.value })} className={form.type === "expense" ? "col-span-2 sm:col-span-1" : ""} />
+                <FieldInput className="col-span-2 sm:col-span-1" placeholder={form.type === "expense" ? "Note (e.g. Costco run)" : "Note (optional)"} value={form.note} onChange={e => setForm({ ...form, note: e.target.value })} />
+                <button onClick={addTx} className="px-3 py-2" style={{ background: "#1F2A1D", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
+                  Log it
+                </button>
+              </div>
             </div>
-          </div>
           ) : (
             <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, color: "#8A9186", fontSize: 13 }}>
               Only the house admin can log contributions and expenses. You can view balances and the ledger below.
@@ -1244,15 +1260,15 @@ function PeopleTab({ members, setMembers, tx, isAdmin, permissions, setPermissio
   return (
     <div>
       {isAdmin ? (
-      <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-          <FieldInput className="col-span-2 sm:col-span-1" placeholder="Name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
-          <FieldInput type="number" min="0" placeholder="Monthly target ($)" value={form.contribution} onChange={e => setForm({ ...form, contribution: e.target.value })} />
-          <button onClick={addMember} className="px-3 py-2" style={{ background: "#4C8B5C", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
-            Add housemate
-          </button>
+        <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            <FieldInput className="col-span-2 sm:col-span-1" placeholder="Name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
+            <FieldInput type="number" min="0" placeholder="Monthly target ($)" value={form.contribution} onChange={e => setForm({ ...form, contribution: e.target.value })} />
+            <button onClick={addMember} className="px-3 py-2" style={{ background: "#4C8B5C", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
+              Add housemate
+            </button>
+          </div>
         </div>
-      </div>
       ) : (
         <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, color: "#8A9186", fontSize: 13 }}>
           Only the house admin can add housemates or change contribution targets.
