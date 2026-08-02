@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { Plus, Minus, Trash2, X, Package, Wallet, Users, AlertTriangle, ArrowUpRight, ArrowDownRight, Sprout, Milk, Beef, Snowflake, Home, ShoppingBasket, Sparkles, KeyRound, MoreHorizontal, Search, Pencil, Check } from "lucide-react";
+import { Plus, Minus, Trash2, X, Package, Wallet, Users, AlertTriangle, ArrowUpRight, ArrowDownRight, Sprout, Milk, Beef, Snowflake, Home, ShoppingBasket, Sparkles, KeyRound, MoreHorizontal, Search, Pencil, Check, Archive, ChevronDown, ChevronUp, ShoppingCart, Activity as ActivityIcon, HandCoins } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
 // ---- storage helpers ---------------------------------------------------
@@ -9,6 +9,9 @@ const KEYS = {
   tx: "household:transactions",
   permissions: "household:permissions",
   credentials: "household:credentials",
+  history: "household:tx-history",
+  shoppingExtra: "household:shopping-extra",
+  activity: "household:activity",
 };
 
 async function loadKey(key, fallback) {
@@ -80,18 +83,24 @@ export default function PantryLedger() {
   const [tx, setTx] = useState([]);
   const [permissions, setPermissions] = useState({});
   const [credentials, setCredentials] = useState({ adminUsername: "", adminPassword: "", users: {} });
+  const [history, setHistory] = useState([]);
+  const [shoppingExtra, setShoppingExtra] = useState([]);
+  const [activity, setActivity] = useState([]);
   const [ready, setReady] = useState(false);
   const [identity, setIdentity] = useState(null);
   const [identityChecked, setIdentityChecked] = useState(false);
 
   useEffect(() => {
     (async () => {
-      const [m, p, t, perms, creds, id] = await Promise.all([
+      const [m, p, t, perms, creds, hist, extra, act, id] = await Promise.all([
         loadKey(KEYS.members, []),
         loadKey(KEYS.pantry, []),
         loadKey(KEYS.tx, []),
         loadKey(KEYS.permissions, {}),
         loadKey(KEYS.credentials, { adminUsername: "", adminPassword: "", users: {} }),
+        loadKey(KEYS.history, []),
+        loadKey(KEYS.shoppingExtra, []),
+        loadKey(KEYS.activity, []),
         loadIdentity(),
       ]);
       setMembers(m);
@@ -99,6 +108,9 @@ export default function PantryLedger() {
       setTx(t);
       setPermissions(perms);
       setCredentials(creds);
+      setHistory(hist);
+      setShoppingExtra(extra);
+      setActivity(act);
       setIdentity(id);
       setReady(true);
       setIdentityChecked(true);
@@ -119,20 +131,28 @@ export default function PantryLedger() {
   const persistTx = useCallback((next) => { setTx(next); saveKey(KEYS.tx, next); }, []);
   const persistPermissions = useCallback((next) => { setPermissions(next); saveKey(KEYS.permissions, next); }, []);
   const persistCredentials = useCallback((next) => { setCredentials(next); saveKey(KEYS.credentials, next); }, []);
+  const persistHistory = useCallback((next) => { setHistory(next); saveKey(KEYS.history, next); }, []);
+  const persistShoppingExtra = useCallback((next) => { setShoppingExtra(next); saveKey(KEYS.shoppingExtra, next); }, []);
 
   const reloadAll = useCallback(async () => {
-    const [m, p, t, perms, creds] = await Promise.all([
+    const [m, p, t, perms, creds, hist, extra, act] = await Promise.all([
       loadKey(KEYS.members, []),
       loadKey(KEYS.pantry, []),
       loadKey(KEYS.tx, []),
       loadKey(KEYS.permissions, {}),
       loadKey(KEYS.credentials, { adminUsername: "", adminPassword: "", users: {} }),
+      loadKey(KEYS.history, []),
+      loadKey(KEYS.shoppingExtra, []),
+      loadKey(KEYS.activity, []),
     ]);
     setMembers(m);
     setPantry(p);
     setTx(t);
     setPermissions(perms);
     setCredentials(creds);
+    setHistory(hist);
+    setShoppingExtra(extra);
+    setActivity(act);
   }, []);
 
   // Live sync: when anyone in the house changes data, pull the latest
@@ -159,10 +179,41 @@ export default function PantryLedger() {
   const myPerms = identity?.role === "member" ? getPerms(permissions, identity.memberId) : DEFAULT_PERMS;
   const canSeeBudget = isAdmin || myPerms.budget;
   const canSeePeople = isAdmin || myPerms.people;
+  const actorLabel = isAdmin ? "Admin" : (identity?.name || "A housemate");
+
+  const logActivity = useCallback((message, scope) => {
+    setActivity(prev => {
+      const next = [{ id: uid(), actor: actorLabel, message, scope, date: new Date().toISOString() }, ...prev].slice(0, 150);
+      saveKey(KEYS.activity, next);
+      return next;
+    });
+  }, [actorLabel]);
+
+  const closeMonth = useCallback(() => {
+    const now = new Date();
+    const label = now.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+    const record = {
+      id: uid(),
+      label,
+      closedAt: now.toISOString(),
+      tx,
+      totalContributed,
+      totalSpent,
+      perPerson: members.map(m => ({
+        name: m.name,
+        target: m.contribution,
+        contributed: tx.filter(t => t.type === "contribution" && t.person === m.name).reduce((s, t) => s + t.amount, 0),
+      })),
+    };
+    persistHistory([record, ...history]);
+    persistTx([]);
+    logActivity(`closed out ${label} (${tx.length} entries archived)`, "budget");
+  }, [tx, members, history, totalContributed, totalSpent, persistHistory, persistTx, logActivity]);
 
   useEffect(() => {
     if (tab === "budget" && !canSeeBudget) setTab("pantry");
     if (tab === "people" && !canSeePeople) setTab("pantry");
+    if (tab === "history" && !canSeeBudget) setTab("pantry");
   }, [tab, canSeeBudget, canSeePeople]);
 
   if (!ready || !identityChecked) {
@@ -202,13 +253,18 @@ export default function PantryLedger() {
           canSeeBudget={canSeeBudget}
           canSeePeople={canSeePeople}
         />
-        {tab === "pantry" && <PantryTab pantry={pantry} setPantry={persistPantry} isAdmin={isAdmin} />}
+        {tab === "pantry" && <PantryTab pantry={pantry} setPantry={persistPantry} isAdmin={isAdmin} logActivity={logActivity} />}
+        {tab === "shopping" && (
+          <ShoppingTab pantry={pantry} setPantry={persistPantry} shoppingExtra={shoppingExtra} setShoppingExtra={persistShoppingExtra} actorLabel={actorLabel} logActivity={logActivity} />
+        )}
         {tab === "budget" && canSeeBudget && (
-          <BudgetTab members={members} setMembers={persistMembers} tx={tx} setTx={persistTx} poolBalance={poolBalance} totalContributed={totalContributed} totalSpent={totalSpent} isAdmin={isAdmin} />
+          <BudgetTab members={members} setMembers={persistMembers} tx={tx} setTx={persistTx} poolBalance={poolBalance} totalContributed={totalContributed} totalSpent={totalSpent} isAdmin={isAdmin} closeMonth={closeMonth} logActivity={logActivity} />
         )}
         {tab === "people" && canSeePeople && (
-          <PeopleTab members={members} setMembers={persistMembers} tx={tx} isAdmin={isAdmin} permissions={permissions} setPermissions={persistPermissions} credentials={credentials} setCredentials={persistCredentials} />
+          <PeopleTab members={members} setMembers={persistMembers} tx={tx} isAdmin={isAdmin} permissions={permissions} setPermissions={persistPermissions} credentials={credentials} setCredentials={persistCredentials} logActivity={logActivity} />
         )}
+        {tab === "history" && canSeeBudget && <HistoryTab history={history} />}
+        {tab === "activity" && <ActivityTab activity={activity} canSeeBudget={canSeeBudget} canSeePeople={canSeePeople} />}
       </div>
     </div>
   );
@@ -235,8 +291,11 @@ function GlobalStyle() {
 function Header({ lowStockCount, poolBalance, tab, setTab, identity, switchIdentity, canSeeBudget, canSeePeople }) {
   const tabs = [
     { id: "pantry", label: "Pantry", icon: Package, badge: lowStockCount, show: true },
+    { id: "shopping", label: "Shopping", icon: ShoppingCart, show: true },
     { id: "budget", label: "Budget", icon: Wallet, show: canSeeBudget },
+    { id: "history", label: "History", icon: Archive, show: canSeeBudget },
     { id: "people", label: "Household", icon: Users, show: canSeePeople },
+    { id: "activity", label: "Activity", icon: ActivityIcon, show: true },
   ].filter(t => t.show);
   const isAdmin = identity?.role === "admin";
   const label = isAdmin ? "Admin" : (identity?.name || "Housemate");
@@ -388,8 +447,7 @@ function LoginScreen({ credentials, members, onLogin }) {
 }
 
 function StatCard({ label, value, color }) {
-  return (
-    <div>
+  return (<div>
       <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
       <div className="font-display" style={{ color: color || "#1F2A1D", fontSize: 20, fontWeight: 700 }}>{value}</div>
     </div>
@@ -424,7 +482,7 @@ function FieldSelect(props) {
 
 // ---- Pantry tab: card grid ---------------------------------------------
 
-function PantryTab({ pantry, setPantry, isAdmin }) {
+function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
   const [form, setForm] = useState({ name: "", category: CATEGORIES[0].name, qty: 1, unit: "pcs", lowThreshold: 1 });
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState(null);
@@ -435,6 +493,7 @@ function PantryTab({ pantry, setPantry, isAdmin }) {
   const addItem = () => {
     if (!form.name.trim()) return;
     setPantry([...pantry, { id: uid(), ...form, qty: Number(form.qty), lowThreshold: Number(form.lowThreshold) }]);
+    logActivity?.(`added "${form.name.trim()}" to the pantry`, "pantry");
     setForm({ name: "", category: CATEGORIES[0].name, qty: 1, unit: "pcs", lowThreshold: 1 });
     setAdding(false);
   };
@@ -442,13 +501,17 @@ function PantryTab({ pantry, setPantry, isAdmin }) {
     const step = UNIT_STEP[item.unit] || 1;
     setPantry(pantry.map(i => i.id === item.id ? { ...i, qty: Math.max(0, round2(i.qty + dir * step)) } : i));
   };
-  const removeItem = (id) => setPantry(pantry.filter(i => i.id !== id));
+  const removeItem = (item) => {
+    setPantry(pantry.filter(i => i.id !== item.id));
+    logActivity?.(`removed "${item.name}" from the pantry`, "pantry");
+  };
 
   const startEdit = (item) => { setEditingId(item.id); setEditForm({ ...item }); };
   const cancelEdit = () => { setEditingId(null); setEditForm(null); };
   const saveEdit = () => {
     if (!editForm.name.trim()) return;
     setPantry(pantry.map(i => i.id === editingId ? { ...editForm, qty: Number(editForm.qty), lowThreshold: Number(editForm.lowThreshold) } : i));
+    logActivity?.(`edited "${editForm.name.trim()}"`, "pantry");
     cancelEdit();
   };
 
@@ -512,7 +575,7 @@ function PantryTab({ pantry, setPantry, isAdmin }) {
                 <button onClick={() => startEdit(item)} style={{ color: "#B4BAAD", padding: 2 }}>
                   <Pencil size={12} />
                 </button>
-                <button onClick={() => removeItem(item.id)} style={{ color: "#C6CBC0", padding: 2 }}>
+                <button onClick={() => removeItem(item)} style={{ color: "#C6CBC0", padding: 2 }}>
                   <Trash2 size={13} />
                 </button>
               </div>
@@ -644,9 +707,119 @@ function PantryTab({ pantry, setPantry, isAdmin }) {
 
 // ---- Budget tab ------------------------------------------------------
 
-function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContributed, totalSpent, isAdmin }) {
+// ---- Shopping tab -----------------------------------------------------------
+
+function ShoppingTab({ pantry, setPantry, shoppingExtra, setShoppingExtra, actorLabel, logActivity }) {
+  const [restockAmounts, setRestockAmounts] = useState({});
+  const [extraText, setExtraText] = useState("");
+
+  const lowItems = [...pantry.filter(i => i.qty <= i.lowThreshold)].sort((a, b) => (a.qty - a.lowThreshold) - (b.qty - b.lowThreshold));
+
+  const suggestedRestock = (item) => {
+    const target = item.lowThreshold * 2 || UNIT_STEP[item.unit] || 1;
+    return Math.max(round2(target - item.qty), UNIT_STEP[item.unit] || 1);
+  };
+  const amountFor = (item) => restockAmounts[item.id] ?? suggestedRestock(item);
+  const setAmount = (id, val) => setRestockAmounts({ ...restockAmounts, [id]: val });
+
+  const markBought = (item) => {
+    const add = Number(amountFor(item)) || 0;
+    if (add <= 0) return;
+    setPantry(pantry.map(i => i.id === item.id ? { ...i, qty: round2(i.qty + add) } : i));
+    logActivity?.(`bought ${add} ${item.unit} of "${item.name}"`, "pantry");
+    const next = { ...restockAmounts };
+    delete next[item.id];
+    setRestockAmounts(next);
+  };
+
+  const addExtra = () => {
+    if (!extraText.trim()) return;
+    setShoppingExtra([{ id: uid(), name: extraText.trim(), addedBy: actorLabel, date: new Date().toISOString() }, ...shoppingExtra]);
+    logActivity?.(`added "${extraText.trim()}" to the shopping list`, "pantry");
+    setExtraText("");
+  };
+  const removeExtra = (item) => {
+    setShoppingExtra(shoppingExtra.filter(e => e.id !== item.id));
+  };
+  const boughtExtra = (item) => {
+    setShoppingExtra(shoppingExtra.filter(e => e.id !== item.id));
+    logActivity?.(`bought "${item.name}"`, "pantry");
+  };
+
+  return (
+    <div>
+      <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+        From your pantry ({lowItems.length})
+      </div>
+      {lowItems.length === 0 ? (
+        <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 24, color: "#8A9186", fontSize: 13 }}>
+          Nothing running low right now — the pantry's in good shape.
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2 mb-7">
+          {lowItems.map(item => {
+            const cat = catInfo(item.category);
+            const Icon = cat.icon;
+            return (
+              <div key={item.id} className="card-hover flex items-center gap-3 flex-wrap" style={{ background: "#FFFFFF", border: "1px solid #F0C4B8", borderRadius: 12, padding: "10px 12px", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+                <div style={{ width: 30, height: 30, borderRadius: 8, background: cat.color + "1A", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <Icon size={15} color={cat.color} />
+                </div>
+                <div style={{ flex: 1, minWidth: 100 }}>
+                  <div style={{ color: "#1F2A1D", fontSize: 13.5, fontWeight: 600 }}>{item.name}</div>
+                  <div style={{ color: "#C05C4A", fontSize: 11 }}>{item.qty === 0 ? "Out of stock" : `${item.qty} ${item.unit} left`}</div>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <FieldInput type="number" min="0" step="any" value={amountFor(item)} onChange={e => setAmount(item.id, e.target.value)} className="w-16" style={{ padding: "5px 8px", fontSize: 12 }} />
+                  <span style={{ color: "#8A9186", fontSize: 11 }}>{item.unit}</span>
+                  <button onClick={() => markBought(item)} className="flex items-center gap-1" style={{ background: "#4C8B5C", color: "#fff", borderRadius: 7, padding: "6px 10px", fontSize: 11.5, fontWeight: 600 }}>
+                    <Check size={12} /> Bought
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+        Other items to pick up
+      </div>
+      <div className="flex gap-2 mb-3">
+        <FieldInput placeholder="e.g. birthday candles" value={extraText} onChange={e => setExtraText(e.target.value)} onKeyDown={e => e.key === "Enter" && addExtra()} style={{ flex: 1 }} />
+        <button onClick={addExtra} className="px-3.5 py-2" style={{ background: "#1F2A1D", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
+          Add
+        </button>
+      </div>
+      {shoppingExtra.length === 0 ? (
+        <EmptyState icon={ShoppingCart} text="No extra items on the list." />
+      ) : (
+        <div className="flex flex-col gap-1.5">
+          {shoppingExtra.map(item => (
+            <div key={item.id} className="flex items-center gap-3" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 10, padding: "8px 12px" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ color: "#1F2A1D", fontSize: 13 }}>{item.name}</div>
+                <div style={{ color: "#B4BAAD", fontSize: 10.5 }}>added by {item.addedBy}</div>
+              </div>
+              <button onClick={() => boughtExtra(item)} className="flex items-center gap-1" style={{ background: "#4C8B5C", color: "#fff", borderRadius: 7, padding: "5px 9px", fontSize: 11, fontWeight: 600 }}>
+                <Check size={11} /> Bought
+              </button>
+              <button onClick={() => removeExtra(item)} style={{ color: "#C6CBC0", padding: 3 }}>
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContributed, totalSpent, isAdmin, closeMonth, logActivity }) {
   const [form, setForm] = useState({ type: "expense", category: "Groceries", person: "", amount: "", note: "" });
   const [splitWith, setSplitWith] = useState([]);
+  const [confirmClose, setConfirmClose] = useState(false);
+  const monthLabel = new Date().toLocaleDateString(undefined, { month: "long", year: "numeric" });
 
   useEffect(() => {
     if (!form.person && members.length) setForm(f => ({ ...f, person: members[0].name }));
@@ -673,10 +846,25 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
       person: form.type === "expense" ? "Household" : form.person, amount: amt, note: form.note,
       splitWith: splitNames, date: new Date().toISOString(),
     }, ...tx]);
+    logActivity?.(
+      form.type === "expense"
+        ? `logged a ${money(amt)} ${form.category} expense${splitNames ? ` split with ${splitNames.join(", ")}` : ""}`
+        : `logged ${money(amt)} contribution from ${form.person}`,
+      "budget"
+    );
     setForm({ ...form, amount: "", note: "" });
     setSplitWith([]);
   };
-  const removeTx = (id) => setTx(tx.filter(t => t.id !== id));
+  const removeTx = (t) => {
+    setTx(tx.filter(x => x.id !== t.id));
+    logActivity?.(`deleted a ${money(t.amount)} ${t.type === "expense" ? (t.category || "expense") : "contribution"} entry`, "budget");
+  };
+  const settleUp = (member) => {
+    const remaining = round2(member.contribution - tx.filter(t => t.type === "contribution" && t.person === member.name).reduce((s, t) => s + t.amount, 0));
+    if (remaining <= 0) return;
+    setTx([{ id: uid(), type: "contribution", category: null, person: member.name, amount: remaining, note: "Settled up", date: new Date().toISOString() }, ...tx]);
+    logActivity?.(`settled up ${member.name}'s ${money(remaining)} balance`, "budget");
+  };
 
   const spendByCategory = EXPENSE_CATEGORIES.map(c => ({
     ...c,
@@ -685,16 +873,46 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
 
   const perPerson = members.map(m => {
     const contributed = tx.filter(t => t.type === "contribution" && t.person === m.name).reduce((s, t) => s + t.amount, 0);
-    return { ...m, contributed, remaining: m.contribution - contributed };
-  });
+    return { ...m, contributed, remaining: round2(m.contribution - contributed) };
+  }).sort((a, b) => b.remaining - a.remaining);
 
   return (
     <div>
-      <div className="grid grid-cols-3 gap-3 mb-5">
-        <StatCard label="Contributed" value={money(totalContributed)} color="#4C8B5C" />
-        <StatCard label="Spent" value={money(totalSpent)} color="#C05C4A" />
-        <StatCard label="Balance" value={money(poolBalance)} color="#C79A3E" />
+      <div className="flex items-start justify-between flex-wrap gap-2 mb-5">
+        <div className="grid grid-cols-3 gap-3 flex-1">
+          <StatCard label="Contributed" value={money(totalContributed)} color="#4C8B5C" />
+          <StatCard label="Spent" value={money(totalSpent)} color="#C05C4A" />
+          <StatCard label="Balance" value={money(poolBalance)} color="#C79A3E" />
+        </div>
       </div>
+
+      {isAdmin && tx.length > 0 && (
+        <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 14, marginBottom: 20 }}>
+          {!confirmClose ? (
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div style={{ color: "#4A5247", fontSize: 12.5 }}>Done with {monthLabel}? Archive it and start a fresh ledger.</div>
+              <button onClick={() => setConfirmClose(true)} className="flex items-center gap-1.5 px-3 py-1.5" style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", color: "#4A5247", borderRadius: 8, fontSize: 12.5, fontWeight: 600 }}>
+                <Archive size={13} /> Close out {monthLabel}
+              </button>
+            </div>
+          ) : (
+            <div>
+              <div style={{ color: "#1F2A1D", fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Archive {monthLabel} and start over?</div>
+              <div style={{ color: "#8A9186", fontSize: 12, marginBottom: 10 }}>
+                All {tx.length} entries move to History. Monthly targets stay the same for next month — only what's been paid resets to $0.
+              </div>
+              <div className="flex gap-2">
+                <button onClick={() => { closeMonth(); setConfirmClose(false); }} className="px-3 py-1.5" style={{ background: "#C05C4A", color: "#fff", borderRadius: 8, fontSize: 12.5, fontWeight: 600 }}>
+                  Yes, archive it
+                </button>
+                <button onClick={() => setConfirmClose(false)} className="px-3 py-1.5" style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", color: "#4A5247", borderRadius: 8, fontSize: 12.5, fontWeight: 600 }}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {members.length === 0 ? (
         <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, color: "#4A5247", fontSize: 13 }}>
@@ -793,7 +1011,7 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
             </div>
           )}
 
-          <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Contribution targets</div>
+          <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Settle up</div>
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-7">
             {perPerson.map(m => (
               <div key={m.id} className="card-hover" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: "12px 14px", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
@@ -802,8 +1020,15 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
                 <div style={{ background: "#F0F1EC", borderRadius: 6, height: 6, overflow: "hidden" }}>
                   <div style={{ width: `${m.contribution > 0 ? Math.min(100, (m.contributed / m.contribution) * 100) : 0}%`, background: m.remaining > 0 ? "#C79A3E" : "#4C8B5C", height: "100%" }} />
                 </div>
-                <div style={{ color: m.remaining > 0 ? "#C79A3E" : "#4C8B5C", fontSize: 11.5, fontWeight: 600, marginTop: 6 }}>
-                  {m.remaining > 0 ? `Owes ${money(m.remaining)}` : "Settled up"}
+                <div className="flex items-center justify-between" style={{ marginTop: 6 }}>
+                  <span style={{ color: m.remaining > 0 ? "#C79A3E" : "#4C8B5C", fontSize: 11.5, fontWeight: 600 }}>
+                    {m.remaining > 0 ? `Owes ${money(m.remaining)}` : "Settled up"}
+                  </span>
+                  {isAdmin && m.remaining > 0 && (
+                    <button onClick={() => settleUp(m)} className="flex items-center gap-1" style={{ color: "#4C8B5C", fontSize: 11, fontWeight: 600 }}>
+                      <HandCoins size={12} /> Settle
+                    </button>
+                  )}
                 </div>
               </div>
             ))}
@@ -854,7 +1079,7 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
               <div className="font-display" style={{ color: t.type === "expense" ? "#C05C4A" : "#4C8B5C", fontSize: 13, fontWeight: 700 }}>
                 {t.type === "expense" ? "-" : "+"}{money(t.amount)}
               </div>
-              <button onClick={() => removeTx(t.id)} style={{ color: "#C6CBC0", padding: 3, visibility: isAdmin ? "visible" : "hidden" }}>
+              <button onClick={() => removeTx(t)} style={{ color: "#C6CBC0", padding: 3, visibility: isAdmin ? "visible" : "hidden" }}>
                 <Trash2 size={12} />
               </button>
             </div>
@@ -865,20 +1090,142 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
   );
 }
 
+// ---- History tab -----------------------------------------------------------
+
+function HistoryTab({ history }) {
+  const [expanded, setExpanded] = useState(null);
+
+  if (history.length === 0) {
+    return <EmptyState icon={Archive} text="No archived months yet — closed-out months will show up here." />;
+  }
+
+  return (
+    <div className="flex flex-col gap-2.5">
+      {history.map(rec => {
+        const balance = rec.totalContributed - rec.totalSpent;
+        const open = expanded === rec.id;
+        return (
+          <div key={rec.id} style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, boxShadow: "0 2px 8px rgba(31,42,29,0.04)", overflow: "hidden" }}>
+            <button
+              onClick={() => setExpanded(open ? null : rec.id)}
+              className="w-full flex items-center justify-between"
+              style={{ padding: "14px 16px" }}
+            >
+              <div className="text-left">
+                <div className="font-display" style={{ color: "#1F2A1D", fontSize: 15, fontWeight: 700 }}>{rec.label}</div>
+                <div style={{ color: "#8A9186", fontSize: 11.5 }}>{rec.tx.length} entries</div>
+              </div>
+              <div className="flex items-center gap-4">
+                <div className="text-right">
+                  <div style={{ color: "#8A9186", fontSize: 10.5 }}>contributed / spent</div>
+                  <div className="font-mono" style={{ fontSize: 12.5 }}>
+                    <span style={{ color: "#4C8B5C" }}>{money(rec.totalContributed)}</span>
+                    {" / "}
+                    <span style={{ color: "#C05C4A" }}>{money(rec.totalSpent)}</span>
+                  </div>
+                </div>
+                {open ? <ChevronUp size={16} color="#8A9186" /> : <ChevronDown size={16} color="#8A9186" />}
+              </div>
+            </button>
+
+            {open && (
+              <div style={{ borderTop: "1px solid #F0F1EC", padding: "14px 16px" }}>
+                <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Per person</div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4">
+                  {rec.perPerson.map(p => (
+                    <div key={p.name} style={{ background: "#F7F8F5", borderRadius: 10, padding: "8px 10px" }}>
+                      <div style={{ color: "#1F2A1D", fontSize: 12.5, fontWeight: 600 }}>{p.name}</div>
+                      <div style={{ color: "#8A9186", fontSize: 11 }}>{money(p.contributed)} of {money(p.target)}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Entries</div>
+                <div className="flex flex-col gap-1">
+                  {rec.tx.map(t => (
+                    <div key={t.id} className="flex items-center justify-between" style={{ fontSize: 12, padding: "5px 0", borderBottom: "1px solid #F5F6F2" }}>
+                      <span style={{ color: "#4A5247" }}>
+                        {t.type === "expense" ? `Household · ${t.category || "Other"}` : `${t.person} contributed`}
+                        {t.note && <span style={{ color: "#B4BAAD" }}> — {t.note}</span>}
+                      </span>
+                      <span className="font-mono" style={{ color: t.type === "expense" ? "#C05C4A" : "#4C8B5C", fontWeight: 600 }}>
+                        {t.type === "expense" ? "-" : "+"}{money(t.amount)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---- Activity tab -----------------------------------------------------------
+
+function timeAgo(dateStr) {
+  const diffMs = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days}d ago`;
+  return new Date(dateStr).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+const SCOPE_ICON = { pantry: Package, budget: Wallet, people: Users };
+
+function ActivityTab({ activity, canSeeBudget, canSeePeople }) {
+  const visible = activity.filter(a =>
+    a.scope === "pantry" ? true : a.scope === "budget" ? canSeeBudget : a.scope === "people" ? canSeePeople : true
+  );
+
+  if (visible.length === 0) {
+    return <EmptyState icon={ActivityIcon} text="No activity yet — actions across the house will show up here." />;
+  }
+
+  return (
+    <div className="flex flex-col gap-1">
+      {visible.map(a => {
+        const Icon = SCOPE_ICON[a.scope] || ActivityIcon;
+        return (
+          <div key={a.id} className="flex items-center gap-3" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 10, padding: "9px 12px" }}>
+            <div style={{ width: 26, height: 26, borderRadius: 8, background: "#F7F8F5", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <Icon size={13} color="#8A9186" />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ color: "#1F2A1D", fontWeight: 600 }}>{a.actor}</span>{" "}
+              <span style={{ color: "#4A5247" }}>{a.message}</span>
+            </div>
+            <div style={{ color: "#B4BAAD", fontSize: 11, whiteSpace: "nowrap" }}>{timeAgo(a.date)}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ---- People tab -----------------------------------------------------------
 
 const AVATAR_COLORS = ["#4C8B5C", "#4A7FB5", "#C05C4A", "#C79A3E", "#8D6CB0", "#4CA0AE"];
 
-function PeopleTab({ members, setMembers, tx, isAdmin, permissions, setPermissions, credentials, setCredentials }) {
+function PeopleTab({ members, setMembers, tx, isAdmin, permissions, setPermissions, credentials, setCredentials, logActivity }) {
   const [form, setForm] = useState({ name: "", contribution: "" });
   const [loginDrafts, setLoginDrafts] = useState({});
 
   const addMember = () => {
     if (!form.name.trim()) return;
     setMembers([...members, { id: uid(), name: form.name.trim(), contribution: Number(form.contribution) || 0 }]);
+    logActivity?.(`added ${form.name.trim()} as a housemate`, "people");
     setForm({ name: "", contribution: "" });
   };
-  const removeMember = (id) => setMembers(members.filter(m => m.id !== id));
+  const removeMember = (member) => {
+    setMembers(members.filter(m => m.id !== member.id));
+    logActivity?.(`removed ${member.name} from the household`, "people");
+  };
   const updateTarget = (id, value) => setMembers(members.map(m => m.id === id ? { ...m, contribution: Number(value) || 0 } : m));
   const togglePerm = (memberId, key) => {
     const current = getPerms(permissions, memberId);
@@ -886,10 +1233,11 @@ function PeopleTab({ members, setMembers, tx, isAdmin, permissions, setPermissio
   };
   const draftFor = (id) => loginDrafts[id] || credentials.users?.[id] || { username: "", password: "" };
   const setDraft = (id, field, value) => setLoginDrafts({ ...loginDrafts, [id]: { ...draftFor(id), [field]: value } });
-  const saveLogin = (id) => {
+  const saveLogin = (id, memberName) => {
     const d = draftFor(id);
     if (!d.username?.trim() || !d.password) return;
     setCredentials({ ...credentials, users: { ...credentials.users, [id]: { username: d.username.trim(), password: d.password } } });
+    logActivity?.(`set login credentials for ${memberName}`, "people");
   };
 
   return (
@@ -923,7 +1271,7 @@ function PeopleTab({ members, setMembers, tx, isAdmin, permissions, setPermissio
                   {m.name.charAt(0).toUpperCase()}
                 </div>
                 {isAdmin && (
-                  <button onClick={() => removeMember(m.id)} style={{ color: "#C6CBC0", padding: 3 }}>
+                  <button onClick={() => removeMember(m)} style={{ color: "#C6CBC0", padding: 3 }}>
                     <Trash2 size={13} />
                   </button>
                 )}
@@ -945,7 +1293,7 @@ function PeopleTab({ members, setMembers, tx, isAdmin, permissions, setPermissio
                   <FieldInput placeholder="Username" style={{ padding: "5px 8px", fontSize: 12 }} value={draftFor(m.id).username} onChange={e => setDraft(m.id, "username", e.target.value)} />
                   <div className="flex gap-1.5">
                     <FieldInput type="password" placeholder="Password" style={{ padding: "5px 8px", fontSize: 12, flex: 1 }} value={draftFor(m.id).password} onChange={e => setDraft(m.id, "password", e.target.value)} />
-                    <button onClick={() => saveLogin(m.id)} style={{ background: "#1F2A1D", color: "#fff", borderRadius: 7, padding: "0 10px", fontSize: 11.5, fontWeight: 600 }}>Save</button>
+                    <button onClick={() => saveLogin(m.id, m.name)} style={{ background: "#1F2A1D", color: "#fff", borderRadius: 7, padding: "0 10px", fontSize: 11.5, fontWeight: 600 }}>Save</button>
                   </div>
                   {credentials.users?.[m.id] && <div style={{ color: "#4C8B5C", fontSize: 10.5 }}>Login set ✓</div>}
                 </div>
