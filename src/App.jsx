@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { Plus, Minus, Trash2, X, Package, Wallet, Users, AlertTriangle, ArrowUpRight, ArrowDownRight, Sprout, Milk, Beef, Snowflake, Home, ShoppingBasket, Sparkles, KeyRound, MoreHorizontal, Search, Pencil, Check, Archive, ChevronDown, ChevronUp, ShoppingCart, Activity as ActivityIcon, HandCoins } from "lucide-react";
+import { Plus, Minus, Trash2, X, Package, Wallet, Users, AlertTriangle, ArrowUpRight, ArrowDownRight, Sprout, Milk, Beef, Snowflake, Home, ShoppingBasket, Sparkles, KeyRound, MoreHorizontal, Search, Pencil, Check, Archive, ChevronDown, ChevronUp, ShoppingCart, Activity as ActivityIcon, HandCoins, HelpCircle, Lock, Eye } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
 // ---- storage helpers ---------------------------------------------------
@@ -290,6 +290,7 @@ export default function PantryLedger() {
         )}
         {tab === "history" && canSeeBudget && <HistoryTab history={history} />}
         {tab === "activity" && <ActivityTab activity={activity} canSeeBudget={canSeeBudget} canSeePeople={canSeePeople} />}
+        {tab === "help" && <HelpTab isAdmin={isAdmin} />}
       </div>
     </div>
   );
@@ -322,6 +323,7 @@ function Header({ lowStockCount, poolBalance, tab, setTab, identity, switchIdent
     { id: "history", label: "History", icon: Archive, show: canSeeBudget },
     { id: "people", label: "Household", icon: Users, show: canSeePeople },
     { id: "activity", label: "Activity", icon: ActivityIcon, show: true },
+    { id: "help", label: "Help", icon: HelpCircle, show: true },
   ].filter(t => t.show);
   const label = isAdmin ? "Admin" : (identity?.name || "Housemate");
   return (
@@ -1393,6 +1395,102 @@ function ActivityTab({ activity, canSeeBudget, canSeePeople }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// ---- Help tab -----------------------------------------------------------
+
+function GuideSection({ title, icon: Icon, color, items }) {
+  return (
+    <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 12, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+      <div className="flex items-center gap-2 mb-3">
+        <div style={{ width: 26, height: 26, borderRadius: 8, background: color + "1A", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <Icon size={13} color={color} />
+        </div>
+        <div style={{ color: "#1F2A1D", fontSize: 14, fontWeight: 700 }}>{title}</div>
+      </div>
+      <div className="flex flex-col gap-2">
+        {items.map((item, i) => (
+          <div key={i} style={{ fontSize: 12.5, lineHeight: 1.5 }}>
+            <span style={{ color: "#1F2A1D", fontWeight: 600 }}>{item.t}</span>{" "}
+            <span style={{ color: "#4A5247" }}>{item.d}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function HelpTab({ isAdmin }) {
+  const adminGuide = [
+    {
+      title: "Getting people set up", icon: Users, color: "#4A7FB5",
+      items: [
+        { t: "Add housemates", d: "in the Household tab, give each one a monthly contribution target." },
+        { t: "Assign logins", d: "on each housemate's card — set a username and password so they can log in as themselves." },
+        { t: "Control visibility", d: "toggle whether each housemate can see the Budget or Household tabs. Pantry, Shopping, and Activity are always theirs to use." },
+      ],
+    },
+    {
+      title: "Pantry & Shopping", icon: Package, color: "#4C8B5C",
+      items: [
+        { t: "Add, edit, or remove items", d: "with the pencil and trash icons — only admin can do this; housemates can only adjust quantities." },
+        { t: "Set a low-stock threshold", d: "per item so it shows up under Running Low and on the Shopping list automatically." },
+        { t: "Shopping tab", d: "is admin-only — restock straight from there and it updates pantry quantities." },
+      ],
+    },
+    {
+      title: "Money", icon: Wallet, color: "#C79A3E",
+      items: [
+        { t: "Contribution", d: "logs money going into the shared pool for one person's monthly target." },
+        { t: "Expense", d: "logs money leaving the pool — pick a category (Groceries, Rent, Maid, etc)." },
+        { t: "\"Who paid?\"", d: "on an expense — leave it as Household pool for normal shared spending, or pick a person if they paid out of their own pocket for others (this creates a debt instead of touching the pool)." },
+        { t: "\"Actually paid by\"", d: "on a contribution — use this if one housemate covered another's contribution. The pool credits the covered person, and they owe the payer directly." },
+        { t: "Settle up / Who owes whom", d: "one-tap buttons to clear a pool debt or a person-to-person debt once it's paid back in real life." },
+        { t: "Close out a month", d: "archives the current ledger to History and resets — monthly targets carry over, only what's paid resets to $0." },
+      ],
+    },
+  ];
+
+  const memberGuide = [
+    {
+      title: "Pantry", icon: Package, color: "#4C8B5C",
+      items: [
+        { t: "Search or filter by category", d: "to find an item fast." },
+        { t: "Use the +/− buttons", d: "to update quantity as things get used up or restocked — that's the one thing you can always do here." },
+        { t: "Running Low", d: "at the top shows what needs restocking soonest." },
+      ],
+    },
+    {
+      title: "Money (if your admin's given you access)", icon: Wallet, color: "#C79A3E",
+      items: [
+        { t: "View-only", d: "you can see pool balance, who owes what, and the full ledger, but only the admin can log new money or delete entries." },
+        { t: "Who owes whom", d: "shows any personal debts between housemates, separate from the shared pool." },
+      ],
+    },
+    {
+      title: "Everything else", icon: ActivityIcon, color: "#4A7FB5",
+      items: [
+        { t: "Activity", d: "shows a running feed of what's changed across the house." },
+        { t: "Household tab", d: "(if visible to you) shows the housemate list — only admin can edit it." },
+      ],
+    },
+  ];
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-1">
+        <span style={{ background: isAdmin ? "#1F2A1D" : "#EDEFEA", color: isAdmin ? "#F7F8F5" : "#4A5247", fontSize: 11, fontWeight: 700, borderRadius: 7, padding: "3px 8px" }}>
+          {isAdmin ? "Admin guide" : "Housemate guide"}
+        </span>
+      </div>
+      <div style={{ color: "#8A9186", fontSize: 12.5, marginBottom: 16 }}>
+        {isAdmin ? "What you can do as the house admin." : "What you can do as a housemate — ask your admin if you need access to more."}
+      </div>
+      {(isAdmin ? adminGuide : memberGuide).map((section, i) => (
+        <GuideSection key={i} title={section.title} icon={section.icon} color={section.color} items={section.items} />
+      ))}
     </div>
   );
 }
