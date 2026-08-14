@@ -113,6 +113,8 @@ export default function PantryLedger() {
   const [ready, setReady] = useState(false);
   const [identity, setIdentity] = useState(null);
   const [identityChecked, setIdentityChecked] = useState(false);
+  const [toasts, setToasts] = useState([]);
+  const seenActivityIds = React.useRef(null);
 
   useEffect(() => {
     (async () => {
@@ -135,6 +137,7 @@ export default function PantryLedger() {
       setHistory(hist);
       setShoppingExtra(extra);
       setActivity(act);
+      seenActivityIds.current = new Set(act.map(a => a.id));
       setIdentity(id);
       setReady(true);
       setIdentityChecked(true);
@@ -194,6 +197,25 @@ export default function PantryLedger() {
     };
   }, [ready, reloadAll]);
 
+  // Notification toasts: whenever the shared activity feed gets new pantry
+  // entries of interest (item added, running low, out of stock), pop a
+  // toast for everyone with the page open — from any device, any user.
+  const NOTIFY_TYPES = ["added", "low_stock", "out_of_stock"];
+  useEffect(() => {
+    if (!ready || seenActivityIds.current === null) return;
+    const fresh = activity.filter(a => !seenActivityIds.current.has(a.id));
+    if (fresh.length === 0) return;
+    fresh.forEach(a => seenActivityIds.current.add(a.id));
+    const toastworthy = fresh.filter(a => NOTIFY_TYPES.includes(a.type));
+    if (toastworthy.length > 0) {
+      setToasts(prev => [...toastworthy.map(a => ({ ...a, toastId: uid() })), ...prev].slice(0, 6));
+    }
+  }, [activity, ready]);
+
+  const dismissToast = useCallback((toastId) => {
+    setToasts(prev => prev.filter(t => t.toastId !== toastId));
+  }, []);
+
   const totalContributed = tx.filter(t => t.type === "contribution").reduce((s, t) => s + t.amount, 0);
   const totalSpent = tx.filter(t => t.type === "expense").reduce((s, t) => s + t.amount, 0);
   const poolBalance = totalContributed - totalSpent;
@@ -205,9 +227,9 @@ export default function PantryLedger() {
   const canSeePeople = isAdmin || myPerms.people;
   const actorLabel = isAdmin ? "Admin" : (identity?.name || "A housemate");
 
-  const logActivity = useCallback((message, scope) => {
+  const logActivity = useCallback((message, scope, type) => {
     setActivity(prev => {
-      const next = [{ id: uid(), actor: actorLabel, message, scope, date: new Date().toISOString() }, ...prev].slice(0, 150);
+      const next = [{ id: uid(), actor: actorLabel, message, scope, type: type || null, date: new Date().toISOString() }, ...prev].slice(0, 150);
       saveKey(KEYS.activity, next);
       return next;
     });
@@ -267,6 +289,7 @@ export default function PantryLedger() {
   return (
     <div style={{ background: "#F7F8F5", minHeight: "100vh" }}>
       <GlobalStyle />
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
       <div className="max-w-5xl mx-auto px-4 sm:px-6 pb-24 pt-8 sm:pt-10">
         <Header
           lowStockCount={lowStockCount}
@@ -381,6 +404,52 @@ function Header({ lowStockCount, poolBalance, tab, setTab, identity, switchIdent
           );
         })}
       </div>
+    </div>
+  );
+}
+
+const TOAST_STYLE = {
+  added: { color: "#4C8B5C", icon: Plus },
+  low_stock: { color: "#C79A3E", icon: AlertTriangle },
+  out_of_stock: { color: "#C05C4A", icon: AlertTriangle },
+};
+
+function ToastStack({ toasts, onDismiss }) {
+  if (toasts.length === 0) return null;
+  return (
+    <div
+      className="flex flex-col gap-2"
+      style={{ position: "fixed", top: 16, right: 16, left: 16, zIndex: 1000, maxWidth: 360, marginLeft: "auto" }}
+    >
+      {toasts.map(t => <Toast key={t.toastId} toast={t} onDismiss={onDismiss} />)}
+    </div>
+  );
+}
+
+function Toast({ toast, onDismiss }) {
+  useEffect(() => {
+    const timer = setTimeout(() => onDismiss(toast.toastId), 6000);
+    return () => clearTimeout(timer);
+  }, [toast.toastId, onDismiss]);
+
+  const style = TOAST_STYLE[toast.type] || { color: "#4A5247", icon: ActivityIcon };
+  const Icon = style.icon;
+
+  return (
+    <div
+      className="flex items-start gap-2.5"
+      style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderLeft: `4px solid ${style.color}`, borderRadius: 10, padding: "10px 12px", boxShadow: "0 6px 20px rgba(31,42,29,0.12)" }}
+    >
+      <div style={{ width: 22, height: 22, borderRadius: 7, background: style.color + "1A", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
+        <Icon size={12} color={style.color} />
+      </div>
+      <div style={{ flex: 1, minWidth: 0, fontSize: 12.5 }}>
+        <span style={{ color: "#1F2A1D", fontWeight: 600 }}>{toast.actor}</span>{" "}
+        <span style={{ color: "#4A5247" }}>{toast.message}</span>
+      </div>
+      <button onClick={() => onDismiss(toast.toastId)} style={{ color: "#B4BAAD", flexShrink: 0 }}>
+        <X size={13} />
+      </button>
     </div>
   );
 }
@@ -519,14 +588,35 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
 
   const addItem = () => {
     if (!form.name.trim()) return;
-    setPantry([...pantry, { id: uid(), ...form, qty: Number(form.qty), lowThreshold: Number(form.lowThreshold) }]);
-    logActivity?.(`added "${form.name.trim()}" to the pantry`, "pantry");
+    const name = form.name.trim();
+    const qty = Number(form.qty);
+    const lowThreshold = Number(form.lowThreshold);
+    setPantry([...pantry, { id: uid(), ...form, name, qty, lowThreshold }]);
+    logActivity?.(`added "${name}" to the pantry (${qty} ${form.unit})`, "pantry", "added");
+    if (qty <= lowThreshold) {
+      const msg = qty === 0 ? `"${name}" was added out of stock` : `"${name}" was added already running low (${qty} ${form.unit})`;
+      logActivity?.(msg, "pantry", qty === 0 ? "out_of_stock" : "low_stock");
+    }
     setForm({ name: "", category: CATEGORIES[0].name, qty: 1, unit: "pcs", lowThreshold: 1 });
     setAdding(false);
   };
   const adjustQty = (item, dir) => {
     const step = UNIT_STEP[item.unit] || 1;
-    setPantry(pantry.map(i => i.id === item.id ? { ...i, qty: Math.max(0, round2(i.qty + dir * step)) } : i));
+    const newQty = Math.max(0, round2(item.qty + dir * step));
+    if (newQty === item.qty) return;
+    setPantry(pantry.map(i => i.id === item.id ? { ...i, qty: newQty } : i));
+    logActivity?.(
+      `${dir > 0 ? "added" : "used"} ${step} ${item.unit} of "${item.name}" (now ${newQty} ${item.unit})`,
+      "pantry"
+    );
+    const wasLow = item.qty <= item.lowThreshold;
+    const isLow = newQty <= item.lowThreshold;
+    if (!wasLow && isLow) {
+      const msg = newQty === 0 ? `"${item.name}" is out of stock` : `"${item.name}" is running low (${newQty} ${item.unit} left)`;
+      logActivity?.(msg, "pantry", newQty === 0 ? "out_of_stock" : "low_stock");
+    } else if (newQty === 0 && item.qty > 0) {
+      logActivity?.(`"${item.name}" is out of stock`, "pantry", "out_of_stock");
+    }
   };
   const removeItem = (item) => {
     setPantry(pantry.filter(i => i.id !== item.id));
@@ -537,8 +627,21 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
   const cancelEdit = () => { setEditingId(null); setEditForm(null); };
   const saveEdit = () => {
     if (!editForm.name.trim()) return;
-    setPantry(pantry.map(i => i.id === editingId ? { ...editForm, qty: Number(editForm.qty), lowThreshold: Number(editForm.lowThreshold) } : i));
+    const prevItem = pantry.find(i => i.id === editingId);
+    const newQty = Number(editForm.qty);
+    const newThreshold = Number(editForm.lowThreshold);
+    setPantry(pantry.map(i => i.id === editingId ? { ...editForm, qty: newQty, lowThreshold: newThreshold } : i));
     logActivity?.(`edited "${editForm.name.trim()}"`, "pantry");
+    if (prevItem) {
+      const wasLow = prevItem.qty <= prevItem.lowThreshold;
+      const isLow = newQty <= newThreshold;
+      if (!wasLow && isLow) {
+        const msg = newQty === 0 ? `"${editForm.name.trim()}" is out of stock` : `"${editForm.name.trim()}" is running low (${newQty} ${editForm.unit} left)`;
+        logActivity?.(msg, "pantry", newQty === 0 ? "out_of_stock" : "low_stock");
+      } else if (newQty === 0 && prevItem.qty > 0) {
+        logActivity?.(`"${editForm.name.trim()}" is out of stock`, "pantry", "out_of_stock");
+      }
+    }
     cancelEdit();
   };
 
