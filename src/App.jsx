@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from "react";
-import { Plus, Minus, Trash2, X, Package, Wallet, Users, AlertTriangle, ArrowUpRight, ArrowDownRight, Sprout, Milk, Beef, Snowflake, Home, ShoppingBasket, Sparkles, KeyRound, MoreHorizontal, Search, Pencil, Check, Archive, ChevronDown, ChevronUp, ShoppingCart, Activity as ActivityIcon, HandCoins, HelpCircle, Lock, Eye } from "lucide-react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { Plus, Minus, Trash2, X, Package, Wallet, Users, AlertTriangle, ArrowUpRight, ArrowDownRight, Sprout, Milk, Beef, Snowflake, Home, ShoppingBasket, Sparkles, KeyRound, MoreHorizontal, Search, Pencil, Check, Archive, ChevronDown, ChevronUp, ShoppingCart, Activity as ActivityIcon, HandCoins, HelpCircle, Lock, Eye, EyeOff, LayoutDashboard, Target, Moon, Sun, Settings, LogOut, ShieldCheck, Upload, Download, Copy, FileSpreadsheet } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
 // ---- storage helpers ---------------------------------------------------
@@ -30,8 +30,61 @@ async function saveKey(key, value) {
   }
 }
 
+// ---- theme ("Sage Mist" light / "Forest Night" dark) — same look as Money Manager ----
+const PALETTES = {
+  light: {
+    bg: "#EDF1EA", card: "#F8FAF6", ink: "#26332A", text2: "#4F5C52", muted: "#68766C", faint: "#A3AFA5",
+    line: "#D9E1D7", soft: "#E1E9DF", pos: "#4E8A63", neg: "#BF6455", warn: "#C79A3E",
+    heroA: "#5A9477", heroB: "#3F7B6D", shadow: "0 2px 12px rgba(38,51,42,0.06)", scrim: "rgba(38,51,42,0.42)",
+  },
+  dark: {
+    bg: "#111814", card: "#19221D", ink: "#DCE6DD", text2: "#B2C0B5", muted: "#8C9B90", faint: "#5E6C62",
+    line: "#2A3730", soft: "#222D27", pos: "#58A06F", neg: "#D9776A", warn: "#D2A94F",
+    heroA: "#2E5D49", heroB: "#244A47", shadow: "0 2px 14px rgba(0,0,0,0.30)", scrim: "rgba(0,0,0,0.55)",
+  },
+};
+// T is read by every component while rendering; the root component swaps its values when the theme changes.
+const T = { ...PALETTES.light };
+let HIDE_AMOUNTS = false;
+const applyTheme = (name, hide) => {
+  Object.assign(T, PALETTES[name] || PALETTES.light);
+  HIDE_AMOUNTS = !!hide;
+};
+const PREFS_KEY = "household_prefs"; // per-device (not synced)
+const DEFAULT_PREFS = { theme: "auto", hide: false, autoLockMin: 0 };
+const loadPrefs = () => {
+  try { return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem(PREFS_KEY) || "{}") }; } catch { return { ...DEFAULT_PREFS }; }
+};
+
+// ---- secrets (passwords & recovery code are stored as SHA-256 hashes) ----
+async function sha256(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+const hashPassword = (username, password) => sha256(`hh:${String(username).trim().toLowerCase()}:${password}`);
+const RECOVERY_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
+const genRecoveryCode = () => {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (b) => RECOVERY_CHARS[b % RECOVERY_CHARS.length]).join("").match(/.{4}/g).join("-");
+};
+const formatRecovery = (v) => (v.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 16).match(/.{1,4}/g) || []).join("-");
+const hashRecovery = (code) => sha256("recovery:" + code.toUpperCase().replace(/[^A-Z0-9]/g, ""));
+
+// Checks a password against a stored credential. Understands the old plaintext format
+// ({ password }) as well as the new hashed one ({ passwordHash }); `legacy` tells the caller to upgrade it.
+async function checkSecret(cred, username, password) {
+  if (!cred) return { ok: false };
+  if (cred.passwordHash) return { ok: (await hashPassword(username, password)) === cred.passwordHash };
+  if (cred.password) return { ok: cred.password === password, legacy: cred.password === password };
+  return { ok: false };
+}
+const adminCred = (c) => ({ passwordHash: c.adminPasswordHash, password: c.adminPassword });
+const hasAdmin = (c) => !!(c.adminPasswordHash || c.adminPassword);
+
 const uid = () => Math.random().toString(36).slice(2, 10);
-const money = (n) => (n < 0 ? "-$" : "$") + Math.abs(n).toFixed(2);
+const moneyRaw = (n) => (n < 0 ? "-₹" : "₹") + Math.abs(n).toFixed(2);
+// money() honours the "hide amounts" privacy switch; moneyRaw() is for text that gets exported.
+const money = (n) => (HIDE_AMOUNTS ? "₹ ••••" : moneyRaw(n));
 
 const CATEGORIES = [
   { name: "Produce", color: "#4C8B5C", icon: Sprout },
@@ -101,7 +154,10 @@ const DEFAULT_PERMS = { budget: true, people: true };
 const getPerms = (permissions, memberId) => (memberId && permissions[memberId]) ? permissions[memberId] : DEFAULT_PERMS;
 
 export default function PantryLedger() {
-  const [tab, setTab] = useState("pantry");
+  const [tab, setTab] = useState("overview");
+  const [prefs, setPrefsState] = useState(loadPrefs);
+  const [systemDark, setSystemDark] = useState(() => !!window.matchMedia?.("(prefers-color-scheme: dark)").matches);
+  const [showSettings, setShowSettings] = useState(false);
   const [members, setMembers] = useState([]);
   const [pantry, setPantry] = useState([]);
   const [tx, setTx] = useState([]);
@@ -144,14 +200,48 @@ export default function PantryLedger() {
     })();
   }, []);
 
+  const setPrefs = useCallback((patch) => {
+    setPrefsState((p) => {
+      const n = { ...p, ...patch };
+      try { localStorage.setItem(PREFS_KEY, JSON.stringify(n)); } catch { /* best effort */ }
+      return n;
+    });
+  }, []);
+  const resolvedTheme = prefs.theme === "auto" ? (systemDark ? "dark" : "light") : prefs.theme;
+  applyTheme(resolvedTheme, prefs.hide); // swap the palette BEFORE any child renders
+
+  useEffect(() => {
+    const mq = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!mq) return;
+    const h = (e) => setSystemDark(e.matches);
+    mq.addEventListener("change", h);
+    return () => mq.removeEventListener("change", h);
+  }, []);
+  useEffect(() => {
+    document.body.style.background = T.bg;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", T.bg);
+  }, [resolvedTheme]);
+
   const chooseIdentity = (id) => {
     setIdentity(id);
     saveIdentity(id);
   };
-  const switchIdentity = () => {
+  const switchIdentity = useCallback(() => {
+    setShowSettings(false);
     setIdentity(null);
     saveIdentity(null);
-  };
+  }, []);
+
+  // Optional idle log-out (off by default)
+  useEffect(() => {
+    if (!identity || !prefs.autoLockMin) return;
+    let last = Date.now();
+    const bump = () => { last = Date.now(); };
+    const evs = ["pointerdown", "keydown", "touchstart", "scroll"];
+    evs.forEach((e) => window.addEventListener(e, bump, { passive: true }));
+    const iv = setInterval(() => { if (Date.now() - last > prefs.autoLockMin * 60000) switchIdentity(); }, 10000);
+    return () => { evs.forEach((e) => window.removeEventListener(e, bump)); clearInterval(iv); };
+  }, [identity, prefs.autoLockMin, switchIdentity]);
 
   const persistMembers = useCallback((next) => { setMembers(next); saveKey(KEYS.members, next); }, []);
   const persistPantry = useCallback((next) => { setPantry(next); saveKey(KEYS.pantry, next); }, []);
@@ -225,7 +315,8 @@ export default function PantryLedger() {
   const myPerms = identity?.role === "member" ? getPerms(permissions, identity.memberId) : DEFAULT_PERMS;
   const canSeeBudget = isAdmin || myPerms.budget;
   const canSeePeople = isAdmin || myPerms.people;
-  const actorLabel = isAdmin ? "Admin" : (identity?.name || "A housemate");
+  const displayName = isAdmin ? (credentials.adminName || credentials.adminUsername || "Admin") : (identity?.name || "Housemate");
+  const actorLabel = isAdmin ? (credentials.adminName || "Admin") : (identity?.name || "A housemate");
 
   const logActivity = useCallback((message, scope, type) => {
     setActivity(prev => {
@@ -263,16 +354,85 @@ export default function PantryLedger() {
     if (tab === "shopping" && !isAdmin) setTab("pantry");
   }, [tab, canSeeBudget, canSeePeople, isAdmin]);
 
+  // ---- Settings handlers
+  const saveName = (name) => persistCredentials({ ...credentials, adminName: name.trim().slice(0, 30) });
+  const changePassword = async (current, next) => {
+    if (isAdmin) {
+      const r = await checkSecret(adminCred(credentials), credentials.adminUsername, current);
+      if (!r.ok) return "Current password is incorrect.";
+      const { adminPassword, ...rest } = credentials;
+      persistCredentials({ ...rest, adminPasswordHash: await hashPassword(credentials.adminUsername, next) });
+      return "";
+    }
+    const mine = credentials.users?.[identity.memberId];
+    const r = await checkSecret(mine, mine?.username, current);
+    if (!r.ok) return "Current password is incorrect.";
+    const { password: _old, ...clean } = mine;
+    persistCredentials({ ...credentials, users: { ...credentials.users, [identity.memberId]: { ...clean, passwordHash: await hashPassword(mine.username, next) } } });
+    return "";
+  };
+  const createRecovery = async () => {
+    const code = genRecoveryCode();
+    persistCredentials({ ...credentials, adminRecoveryHash: await hashRecovery(code) });
+    return code;
+  };
+  const downloadFile = (name, text, type) => {
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const a = document.createElement("a");
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  const isoToday = () => new Date().toISOString().slice(0, 10);
+  const exportBackup = () =>
+    downloadFile(
+      `household-backup_${isoToday()}.json`,
+      JSON.stringify({ app: "household-goods", version: 1, exportedAt: new Date().toISOString(), data: { members, pantry, tx, permissions, history, shoppingExtra, activity } }, null, 2),
+      "application/json"
+    );
+  const restoreBackup = async (file) => {
+    try {
+      const d = JSON.parse(await file.text())?.data;
+      const lists = ["members", "pantry", "tx", "history", "shoppingExtra", "activity"];
+      if (!d || !lists.every((k) => Array.isArray(d[k])) || typeof d.permissions !== "object") {
+        return { ok: false, text: "That doesn't look like a Household Goods backup." };
+      }
+      if (!window.confirm(`Replace the current data with this backup (${d.members.length} housemates, ${d.pantry.length} pantry items)?`)) {
+        return { ok: false, text: "Restore cancelled." };
+      }
+      persistMembers(d.members); persistPantry(d.pantry); persistTx(d.tx); persistPermissions(d.permissions || {});
+      persistHistory(d.history); persistShoppingExtra(d.shoppingExtra);
+      setActivity(d.activity); saveKey(KEYS.activity, d.activity);
+      return { ok: true, text: "Backup restored." };
+    } catch {
+      return { ok: false, text: "Couldn't read that file." };
+    }
+  };
+  const exportCsv = () => {
+    const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const rows = tx.map((t) => [t.date?.slice(0, 10), t.type, t.category || "", t.person || t.payer || "", t.splitWith?.join("; ") || "", t.amount, q(t.note)]);
+    const csv = [["Date", "Type", "Category", "Person/Payer", "Split with", "Amount", "Note"].join(","), ...rows.map((r) => r.join(","))].join("\n");
+    downloadFile(`household-ledger_${isoToday()}.csv`, csv, "text/csv;charset=utf-8;");
+  };
+  const eraseAll = async () => {
+    for (const k of Object.values(KEYS)) {
+      try { await window.storage.delete(k, true); } catch { /* best effort */ }
+    }
+    saveIdentity(null);
+    localStorage.removeItem("household_login_fails");
+    window.location.reload();
+  };
+
   if (!ready || !identityChecked) {
     return (
-      <div style={{ background: "#F7F8F5", minHeight: "100vh" }} className="flex items-center justify-center">
+      <div style={{ background: T.bg, minHeight: "100vh" }} className="flex items-center justify-center">
         <GlobalStyle />
-        <div style={{ color: "#8A9186", fontSize: 14 }}>Loading…</div>
+        <div style={{ color: T.muted, fontSize: 14 }}>Loading…</div>
       </div>
     );
   }
 
-  if (!credentials.adminPassword) {
+  if (!hasAdmin(credentials)) {
     return <AdminSetup credentials={credentials} setCredentials={persistCredentials} onDone={() => chooseIdentity({ role: "admin" })} />;
   }
 
@@ -280,14 +440,16 @@ export default function PantryLedger() {
     return (
       <LoginScreen
         credentials={credentials}
+        setCredentials={persistCredentials}
         members={members}
         onLogin={chooseIdentity}
+        onErase={eraseAll}
       />
     );
   }
 
   return (
-    <div style={{ background: "#F7F8F5", minHeight: "100vh" }}>
+    <div style={{ background: T.bg, minHeight: "100vh" }}>
       <GlobalStyle />
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
       <div className="max-w-5xl mx-auto px-4 sm:px-6 pb-24 pt-8 sm:pt-10">
@@ -297,10 +459,19 @@ export default function PantryLedger() {
           tab={tab}
           setTab={setTab}
           identity={identity}
-          switchIdentity={switchIdentity}
           canSeeBudget={canSeeBudget}
           canSeePeople={canSeePeople}
+          displayName={displayName}
+          prefs={prefs}
+          setPrefs={setPrefs}
+          resolvedTheme={resolvedTheme}
+          onSettings={() => setShowSettings(true)}
+          onLogout={switchIdentity}
         />
+        <div key={tab} className="fade-up">
+        {tab === "overview" && (
+          <OverviewTab pantry={pantry} shoppingExtra={shoppingExtra} tx={tx} activity={activity} members={members} poolBalance={poolBalance} totalContributed={totalContributed} totalSpent={totalSpent} canSeeBudget={canSeeBudget} canSeePeople={canSeePeople} setTab={setTab} />
+        )}
         {tab === "pantry" && <PantryTab pantry={pantry} setPantry={persistPantry} isAdmin={isAdmin} logActivity={logActivity} />}
         {tab === "shopping" && isAdmin && (
           <ShoppingTab pantry={pantry} setPantry={persistPantry} shoppingExtra={shoppingExtra} setShoppingExtra={persistShoppingExtra} actorLabel={actorLabel} logActivity={logActivity} />
@@ -314,7 +485,27 @@ export default function PantryLedger() {
         {tab === "history" && canSeeBudget && <HistoryTab history={history} />}
         {tab === "activity" && <ActivityTab activity={activity} canSeeBudget={canSeeBudget} canSeePeople={canSeePeople} />}
         {tab === "help" && <HelpTab isAdmin={isAdmin} />}
+        </div>
       </div>
+      {showSettings && (
+        <SettingsModal
+          prefs={prefs}
+          setPrefs={setPrefs}
+          isAdmin={isAdmin}
+          displayName={displayName}
+          onSaveName={saveName}
+          hasRecovery={!!credentials.adminRecoveryHash}
+          canExport={canSeeBudget}
+          onChangePassword={changePassword}
+          onCreateRecovery={createRecovery}
+          onBackup={exportBackup}
+          onRestore={restoreBackup}
+          onExportCsv={exportCsv}
+          onErase={eraseAll}
+          onLogout={switchIdentity}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
     </div>
   );
 }
@@ -322,24 +513,105 @@ export default function PantryLedger() {
 // ---- shared chrome ---------------------------------------------------
 
 function GlobalStyle() {
+  const dark = T.bg === PALETTES.dark.bg;
   return (
     <style>{`
       @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Inter:wght@400;500;600&display=swap');
+      :root { color-scheme: ${dark ? "dark" : "light"}; }
       * { font-family: 'Inter', sans-serif; box-sizing: border-box; }
+      html, body { background: ${T.bg}; transition: background-color .25s ease; }
+      body { color: ${T.ink}; -webkit-font-smoothing: antialiased; }
       .font-display { font-family: 'Manrope', sans-serif; }
-      input, select { outline: none; }
-      input:focus, select:focus { box-shadow: 0 0 0 3px rgba(76,139,92,0.15); border-color: #4C8B5C !important; }
-      ::-webkit-scrollbar { width: 8px; height: 8px; }
-      ::-webkit-scrollbar-thumb { background: #DCE0D6; border-radius: 4px; }
-      .card-hover { transition: box-shadow .15s ease, transform .15s ease; }
-      .card-hover:hover { box-shadow: 0 6px 20px rgba(31,42,29,0.08); transform: translateY(-1px); }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important; }
+      input, select, textarea { outline: none; }
+      input:focus, select:focus { box-shadow: 0 0 0 3px ${T.pos}33; border-color: ${T.pos} !important; }
+      input::placeholder { color: ${T.faint}; }
+      button { cursor: pointer; transition: transform .12s ease, opacity .15s ease, background-color .2s ease, border-color .2s ease; }
+      button:active:not(:disabled) { transform: scale(.97); }
+      button:disabled { cursor: not-allowed; }
+      ::-webkit-scrollbar { width: 6px; height: 6px; }
+      ::-webkit-scrollbar-thumb { background: ${T.line}; border-radius: 4px; }
+      .card-hover { transition: box-shadow .2s ease, transform .2s ease; }
+      .card-hover:hover { box-shadow: 0 8px 24px ${dark ? "rgba(0,0,0,0.35)" : "rgba(38,51,42,0.09)"}; transform: translateY(-1px); }
+      @keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+      @keyframes shake { 0%,100% { transform: translateX(0); } 20% { transform: translateX(-8px); } 40% { transform: translateX(7px); } 60% { transform: translateX(-5px); } 80% { transform: translateX(3px); } }
+      @keyframes sheetIn { from { opacity: 0; transform: translateY(24px); } to { opacity: 1; transform: none; } }
+      .fade-up { animation: fadeUp .35s ease both; }
+      .shake { animation: shake .35s ease; }
+      .sheet-in { animation: sheetIn .28s ease both; }
+      @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+      /* Re-colour the few Tailwind utility classes used around the app so they follow the theme */
+      .bg-white { background-color: ${T.card} !important; }
+      .bg-slate-50, .hover\\:bg-slate-50:hover { background-color: ${T.bg} !important; }
+      .bg-slate-100, .hover\\:bg-slate-100\\/70:hover, .hover\\:bg-slate-200:hover { background-color: ${T.soft} !important; }
+      .bg-slate-900 { background-color: ${T.ink} !important; color: ${T.bg} !important; }
+      .hover\\:bg-slate-800:hover { background-color: ${T.text2} !important; }
+      .border-slate-200, .border-slate-100 { border-color: ${T.line} !important; }
+      .border-slate-900 { border-color: ${T.ink} !important; }
+      .text-slate-400 { color: ${T.faint} !important; }
+      .text-slate-500, .text-slate-600, .hover\\:text-slate-600:hover { color: ${T.muted} !important; }
+      .text-slate-700 { color: ${T.text2} !important; }
+      .text-slate-800, .text-slate-900, .hover\\:text-slate-800:hover { color: ${T.ink} !important; }
+      .bg-emerald-50, .bg-emerald-100\\/70, .hover\\:bg-emerald-100:hover { background-color: ${T.pos}22 !important; }
+      .bg-rose-50, .hover\\:bg-rose-100:hover { background-color: ${T.neg}22 !important; }
+      .text-emerald-600, .text-emerald-700, .text-emerald-800, .hover\\:text-emerald-800:hover { color: ${T.pos} !important; }
+      .text-rose-700, .text-rose-800, .hover\\:text-rose-600:hover { color: ${T.neg} !important; }
+      .bg-emerald-600 { background-color: ${T.pos} !important; }
+      .bg-rose-600 { background-color: ${T.neg} !important; }
+      .border-emerald-600 { border-color: ${T.pos} !important; }
     `}</style>
   );
 }
 
-function Header({ lowStockCount, poolBalance, tab, setTab, identity, switchIdentity, canSeeBudget, canSeePeople }) {
+
+function BrandMark({ size = 40 }) {
+  return (
+    <div style={{ width: size, height: size, borderRadius: size * 0.32, background: `linear-gradient(135deg, ${T.heroA}, ${T.heroB})`, display: "flex", alignItems: "center", justifyContent: "center", boxShadow: T.shadow, flexShrink: 0 }}>
+      <Home size={size * 0.5} color="#fff" />
+    </div>
+  );
+}
+
+// ---- Settings ---------------------------------------------------------------
+
+function AuthShell({ children }) {
+  return (
+    <div style={{ background: `radial-gradient(900px 420px at 50% -8%, ${T.soft}, ${T.bg})`, minHeight: "100vh" }} className="flex items-center justify-center px-4 py-8">
+      <GlobalStyle />
+      <div className="fade-up" style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 22, padding: 26, maxWidth: 380, width: "100%", boxShadow: T.shadow }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function PrimaryButton({ children, style, ...rest }) {
+  return (
+    <button {...rest} className="w-full" style={{ background: T.pos, color: "#fff", borderRadius: 12, padding: "12px 16px", fontWeight: 700, fontSize: 13.5, opacity: rest.disabled ? 0.5 : 1, ...style }}>
+      {children}
+    </button>
+  );
+}
+function LinkButton({ children, ...rest }) {
+  return <button {...rest} style={{ color: T.muted, fontSize: 12.5, textDecoration: "underline", ...rest.style }}>{children}</button>;
+}
+
+
+
+function IconButton({ children, label, onClick, active }) {
+  return (
+    <button onClick={onClick} aria-label={label} title={label} style={{ width: 36, height: 36, borderRadius: 11, display: "flex", alignItems: "center", justifyContent: "center", background: active ? T.soft : T.card, color: active ? T.pos : T.text2, border: `1px solid ${T.line}`, boxShadow: T.shadow }}>
+      {children}
+    </button>
+  );
+}
+
+
+function Header({ lowStockCount, poolBalance, tab, setTab, identity, canSeeBudget, canSeePeople, displayName, prefs, setPrefs, resolvedTheme, onSettings, onLogout }) {
   const isAdmin = identity?.role === "admin";
   const tabs = [
+    { id: "overview", label: "Home", icon: LayoutDashboard, show: true },
     { id: "pantry", label: "Pantry", icon: Package, badge: lowStockCount, show: true },
     { id: "shopping", label: "Shopping", icon: ShoppingCart, show: isAdmin },
     { id: "budget", label: "Budget", icon: Wallet, show: canSeeBudget },
@@ -347,58 +619,47 @@ function Header({ lowStockCount, poolBalance, tab, setTab, identity, switchIdent
     { id: "people", label: "Household", icon: Users, show: canSeePeople },
     { id: "activity", label: "Activity", icon: ActivityIcon, show: true },
     { id: "help", label: "Help", icon: HelpCircle, show: true },
-  ].filter(t => t.show);
-  const label = isAdmin ? "Admin" : (identity?.name || "Housemate");
+  ].filter((t) => t.show);
+  const hr = new Date().getHours();
+  const greeting = hr < 5 ? "Still up?" : hr < 12 ? "Good morning" : hr < 17 ? "Good afternoon" : hr < 21 ? "Good evening" : "Good night";
   return (
-    <div className="mb-7">
-      <div className="flex items-start justify-between flex-wrap gap-3 mb-3">
-        <div>
-          <h1 className="font-display" style={{ color: "#1F2A1D", fontSize: 28, fontWeight: 800, letterSpacing: -0.5 }}>
-            Household Goods
-          </h1>
-          <div style={{ color: "#8A9186", fontSize: 13, marginTop: 2 }}>Shared pantry stock &amp; grocery budget</div>
-        </div>
-        <div
-          className="card-hover"
-          style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: "10px 18px", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}
-        >
-          <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>Pool balance</div>
-          <div className="font-display" style={{ color: poolBalance < 0 ? "#C05C4A" : "#1F2A1D", fontSize: 20, fontWeight: 700 }}>
-            {money(poolBalance)}
+    <div className="mb-6">
+      <div className="flex items-center justify-between gap-3 mb-4">
+        <div className="flex items-center gap-3" style={{ minWidth: 0 }}>
+          <BrandMark size={42} />
+          <div style={{ minWidth: 0 }}>
+            <h1 className="font-display" style={{ color: T.ink, fontSize: 21, fontWeight: 800, letterSpacing: -0.4, lineHeight: 1.15 }}>Household Goods</h1>
+            <div style={{ color: T.muted, fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {greeting}, <strong style={{ color: T.ink, fontWeight: 700 }}>{displayName}</strong>
+              {isAdmin && <span style={{ background: T.pos + "22", color: T.pos, fontSize: 10, fontWeight: 700, borderRadius: 6, padding: "1px 6px", marginLeft: 6 }}>ADMIN</span>}
+            </div>
           </div>
         </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <IconButton label={prefs.hide ? "Show amounts" : "Hide amounts"} active={prefs.hide} onClick={() => setPrefs({ hide: !prefs.hide })}>
+            {prefs.hide ? <EyeOff size={16} /> : <Eye size={16} />}
+          </IconButton>
+          <IconButton label={resolvedTheme === "dark" ? "Switch to light" : "Switch to dark"} onClick={() => setPrefs({ theme: resolvedTheme === "dark" ? "light" : "dark" })}>
+            {resolvedTheme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+          </IconButton>
+          <IconButton label="Settings" onClick={onSettings}><Settings size={16} /></IconButton>
+          <IconButton label="Log out" onClick={onLogout}><LogOut size={16} /></IconButton>
+        </div>
       </div>
-      <div className="flex items-center gap-2 mb-5">
-        <span style={{ background: isAdmin ? "#1F2A1D" : "#EDEFEA", color: isAdmin ? "#F7F8F5" : "#4A5247", fontSize: 11, fontWeight: 700, borderRadius: 7, padding: "3px 8px" }}>
-          {label} {!isAdmin && "· Housemate"}
-        </span>
-        <button onClick={switchIdentity} style={{ color: "#8A9186", fontSize: 11.5, textDecoration: "underline" }}>
-          switch
-        </button>
-      </div>
-      <div className="flex gap-2 flex-wrap">
+      <div className="flex gap-1.5 overflow-x-auto pb-1" style={{ scrollbarWidth: "none" }}>
         {tabs.map(({ id, label, icon: Icon, badge }) => {
           const active = tab === id;
           return (
             <button
               key={id}
               onClick={() => setTab(id)}
-              className="flex items-center gap-1.5 px-4 py-2"
-              style={{
-                background: active ? "#1F2A1D" : "#FFFFFF",
-                color: active ? "#F7F8F5" : "#4A5247",
-                border: `1px solid ${active ? "#1F2A1D" : "#E7E9E2"}`,
-                borderRadius: 10,
-                fontSize: 13.5,
-                fontWeight: 600,
-              }}
+              className="flex items-center gap-1.5 px-3.5 py-2 flex-shrink-0"
+              style={{ background: active ? T.pos : T.card, color: active ? "#fff" : T.text2, border: `1px solid ${active ? T.pos : T.line}`, borderRadius: 999, fontSize: 13, fontWeight: 600, boxShadow: active ? "none" : T.shadow }}
             >
-              <Icon size={15} />
+              <Icon size={14} />
               {label}
               {badge > 0 && (
-                <span style={{ background: active ? "#F7F8F5" : "#C05C4A", color: active ? "#1F2A1D" : "#fff", fontSize: 10, borderRadius: 8, padding: "1px 6px", fontWeight: 700 }}>
-                  {badge}
-                </span>
+                <span style={{ background: active ? "#fff" : T.neg, color: active ? T.pos : "#fff", fontSize: 10, borderRadius: 8, padding: "1px 5px", fontWeight: 700 }}>{badge}</span>
               )}
             </button>
           );
@@ -432,127 +693,593 @@ function Toast({ toast, onDismiss }) {
     return () => clearTimeout(timer);
   }, [toast.toastId, onDismiss]);
 
-  const style = TOAST_STYLE[toast.type] || { color: "#4A5247", icon: ActivityIcon };
+  const style = TOAST_STYLE[toast.type] || { color: T.text2, icon: ActivityIcon };
   const Icon = style.icon;
 
   return (
     <div
       className="flex items-start gap-2.5"
-      style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderLeft: `4px solid ${style.color}`, borderRadius: 10, padding: "10px 12px", boxShadow: "0 6px 20px rgba(31,42,29,0.12)" }}
+      style={{ background: T.card, border: `1px solid ${T.line}`, borderLeft: `4px solid ${style.color}`, borderRadius: 10, padding: "10px 12px", boxShadow: T.shadow }}
     >
       <div style={{ width: 22, height: 22, borderRadius: 7, background: style.color + "1A", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
         <Icon size={12} color={style.color} />
       </div>
       <div style={{ flex: 1, minWidth: 0, fontSize: 12.5 }}>
-        <span style={{ color: "#1F2A1D", fontWeight: 600 }}>{toast.actor}</span>{" "}
-        <span style={{ color: "#4A5247" }}>{toast.message}</span>
+        <span style={{ color: T.ink, fontWeight: 600 }}>{toast.actor}</span>{" "}
+        <span style={{ color: T.text2 }}>{toast.message}</span>
       </div>
-      <button onClick={() => onDismiss(toast.toastId)} style={{ color: "#B4BAAD", flexShrink: 0 }}>
+      <button onClick={() => onDismiss(toast.toastId)} style={{ color: T.faint, flexShrink: 0 }}>
         <X size={13} />
       </button>
     </div>
   );
 }
 
-function AuthShell({ children }) {
+
+function Segmented({ options, value, onChange }) {
   return (
-    <div style={{ background: "#F7F8F5", minHeight: "100vh" }} className="flex items-center justify-center px-4">
-      <GlobalStyle />
-      <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 16, padding: 28, maxWidth: 380, width: "100%", boxShadow: "0 4px 16px rgba(31,42,29,0.06)" }}>
-        {children}
+    <div style={{ display: "flex", background: T.soft, borderRadius: 10, padding: 3, gap: 2 }}>
+      {options.map((o) => (
+        <button key={o.id} onClick={() => onChange(o.id)} style={{ flex: 1, padding: "6px 10px", borderRadius: 8, fontSize: 12.5, fontWeight: 600, background: value === o.id ? T.card : "transparent", color: value === o.id ? T.ink : T.muted, boxShadow: value === o.id ? T.shadow : "none" }}>
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Switch({ on, onChange }) {
+  return (
+    <button role="switch" aria-checked={on} onClick={() => onChange(!on)} style={{ width: 42, height: 24, borderRadius: 99, background: on ? T.pos : T.faint, position: "relative", flexShrink: 0 }}>
+      <span style={{ position: "absolute", top: 3, left: on ? 21 : 3, width: 18, height: 18, borderRadius: 99, background: "#fff", transition: "left .18s ease" }} />
+    </button>
+  );
+}
+
+function SettingsSection({ title, children }) {
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase", color: T.muted, marginBottom: 8 }}>{title}</div>
+      <div className="flex flex-col gap-3">{children}</div>
+    </div>
+  );
+}
+function SettingsRow({ label, hint, children }) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 13.5, fontWeight: 600, color: T.ink }}>{label}</div>
+        {hint && <div style={{ fontSize: 11.5, color: T.muted, marginTop: 1 }}>{hint}</div>}
+      </div>
+      {children}
+    </div>
+  );
+}
+function SoftButton({ children, danger, ...rest }) {
+  return (
+    <button {...rest} className="flex items-center justify-center gap-2" style={{ background: T.soft, color: danger ? T.neg : T.ink, border: `1px solid ${T.line}`, borderRadius: 10, padding: "9px 12px", fontSize: 13, fontWeight: 600, ...rest.style }}>
+      {children}
+    </button>
+  );
+}
+
+
+// ---- auth screens ------------------------------------------------------------
+
+const FAIL_KEY = "household_login_fails"; // per-device wrong-password counter
+const readFails = () => { try { return JSON.parse(localStorage.getItem(FAIL_KEY)) || { count: 0, until: 0 }; } catch { return { count: 0, until: 0 }; } };
+
+function PasswordField({ value, onChange, placeholder = "Password", onKeyDown, autoFocus }) {
+  const [show, setShow] = useState(false);
+  return (
+    <div style={{ position: "relative" }}>
+      <FieldInput autoFocus={autoFocus} type={show ? "text" : "password"} placeholder={placeholder} value={value} onChange={onChange} onKeyDown={onKeyDown} style={{ width: "100%", paddingRight: 38 }} />
+      <button type="button" aria-label={show ? "Hide password" : "Show password"} onClick={() => setShow(!show)} style={{ position: "absolute", right: 8, top: 0, bottom: 0, color: T.muted }}>
+        {show ? <EyeOff size={15} /> : <Eye size={15} />}
+      </button>
+    </div>
+  );
+}
+
+function AuthHeading({ title, subtitle }) {
+  return (
+    <div className="flex items-center gap-3 mb-4"><BrandMark /><div>
+      <h1 className="font-display" style={{ color: T.ink, fontSize: 20, fontWeight: 800 }}>{title}</h1>
+      {subtitle && <div style={{ color: T.muted, fontSize: 12.5 }}>{subtitle}</div>}
+    </div></div>
+  );
+}
+
+function AdminSetup({ credentials, setCredentials, onDone }) {
+  const [step, setStep] = useState("form");
+  const [name, setName] = useState("");
+  const [username, setUsername] = useState("admin");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [code] = useState(genRecoveryCode);
+  const [saved, setSaved] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const next = () => {
+    if (!username.trim() || !password) return setError("Enter a username and password.");
+    if (password.length < 4) return setError("Use at least 4 characters for the password.");
+    if (password !== confirm) return setError("Passwords don't match.");
+    setError("");
+    setStep("code");
+  };
+  const finish = async (withCode) => {
+    setBusy(true);
+    const { adminPassword, ...rest } = credentials; // never keep a plaintext password
+    setCredentials({
+      ...rest,
+      adminName: name.trim(),
+      adminUsername: username.trim(),
+      adminPasswordHash: await hashPassword(username, password),
+      ...(withCode ? { adminRecoveryHash: await hashRecovery(code) } : {}),
+    });
+    onDone();
+  };
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(code); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch { /* best effort */ }
+  };
+
+  if (step === "code") {
+    return (
+      <AuthShell>
+        <AuthHeading title="Save your recovery code" />
+        <div style={{ color: T.muted, fontSize: 12.5, lineHeight: 1.5, marginBottom: 14 }}>
+          If you forget the admin password, this code is the only way back in without erasing the household's data. It won't be shown again.
+        </div>
+        <div className="mono" style={{ background: T.soft, border: `1px dashed ${T.faint}`, borderRadius: 12, padding: "14px 10px", textAlign: "center", fontSize: 17, fontWeight: 700, letterSpacing: 1.5, color: T.ink, userSelect: "all" }}>{code}</div>
+        <button onClick={copy} className="flex items-center justify-center gap-2 w-full" style={{ marginTop: 10, background: T.soft, color: T.ink, border: `1px solid ${T.line}`, borderRadius: 10, padding: "9px 12px", fontSize: 13, fontWeight: 600 }}>
+          <Copy size={14} /> {copied ? "Copied!" : "Copy code"}
+        </button>
+        <label className="flex items-center gap-2" style={{ margin: "14px 0", fontSize: 12.5, color: T.text2, cursor: "pointer" }}>
+          <input type="checkbox" checked={saved} onChange={(e) => setSaved(e.target.checked)} /> I've saved my recovery code
+        </label>
+        <PrimaryButton disabled={!saved || busy} onClick={() => finish(true)}>Finish setup</PrimaryButton>
+        <div className="text-center mt-3"><LinkButton onClick={() => finish(false)}>Skip for now (you can create one in Settings)</LinkButton></div>
+      </AuthShell>
+    );
+  }
+  return (
+    <AuthShell>
+      <AuthHeading title="Welcome 👋" subtitle="Set up the admin login" />
+      <div style={{ color: T.muted, fontSize: 12.5, lineHeight: 1.5, marginBottom: 14 }}>
+        You're the first one here. You'll use this to give your housemates their own logins.
+      </div>
+      <div className="flex flex-col gap-2 mb-3">
+        <FieldInput placeholder="Your name (shown in the greeting)" value={name} maxLength={30} onChange={(e) => setName(e.target.value)} />
+        <FieldInput placeholder="Admin username" value={username} onChange={(e) => setUsername(e.target.value)} />
+        <PasswordField value={password} onChange={(e) => setPassword(e.target.value)} />
+        <PasswordField placeholder="Confirm password" value={confirm} onChange={(e) => setConfirm(e.target.value)} onKeyDown={(e) => e.key === "Enter" && next()} />
+      </div>
+      <div style={{ minHeight: 20, color: T.neg, fontSize: 12.5, marginBottom: 6 }}>{error}</div>
+      <PrimaryButton onClick={next}>Continue</PrimaryButton>
+    </AuthShell>
+  );
+}
+
+function LoginScreen({ credentials, setCredentials, members, onLogin, onErase }) {
+  const [view, setView] = useState("login"); // login | forgot | newpass | erase
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [shake, setShake] = useState(false);
+  const [fails, setFails] = useState(readFails);
+  const [now, setNow] = useState(Date.now());
+  const [forgotAs, setForgotAs] = useState("admin");
+  const [codeInput, setCodeInput] = useState("");
+  const [np, setNp] = useState({ next: "", confirm: "" });
+  const [eraseText, setEraseText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const locked = fails.until > now;
+  const secsLeft = Math.max(0, Math.ceil((fails.until - now) / 1000));
+
+  useEffect(() => {
+    if (!locked) return;
+    const t = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(t);
+  }, [locked]);
+
+  const go = (v) => { setView(v); setError(""); };
+  const fail = () => {
+    const count = fails.count + 1;
+    const until = count % 5 === 0 ? Date.now() + Math.min(30 * 2 ** (count / 5 - 1), 900) * 1000 : 0;
+    const next = { count, until };
+    localStorage.setItem(FAIL_KEY, JSON.stringify(next));
+    setFails(next); setNow(Date.now()); setPassword("");
+    setShake(true); setTimeout(() => setShake(false), 400);
+    const left = 5 - (count % 5);
+    setError(until ? "Too many wrong attempts." : left <= 2 ? `Incorrect username or password · ${left} ${left === 1 ? "try" : "tries"} left before a short lock` : "Incorrect username or password.");
+  };
+  const ok = (identity) => { localStorage.removeItem(FAIL_KEY); onLogin(identity); };
+
+  const submit = async () => {
+    if (locked || !username.trim() || !password) return;
+    setBusy(true);
+    try {
+      const u = username.trim();
+      if (u === credentials.adminUsername) {
+        const r = await checkSecret(adminCred(credentials), u, password);
+        if (r.ok) {
+          if (r.legacy) { // silently upgrade the old plaintext password to a hash
+            const { adminPassword, ...rest } = credentials;
+            setCredentials({ ...rest, adminPasswordHash: await hashPassword(u, password) });
+          }
+          return ok({ role: "admin" });
+        }
+      }
+      for (const [memberId, cred] of Object.entries(credentials.users || {})) {
+        if (cred.username !== u) continue;
+        const r = await checkSecret(cred, u, password);
+        const member = members.find((m) => m.id === memberId);
+        if (r.ok && member) {
+          if (r.legacy) {
+            const { password: _old, ...clean } = cred;
+            setCredentials({ ...credentials, users: { ...credentials.users, [memberId]: { ...clean, passwordHash: await hashPassword(u, password) } } });
+          }
+          return ok({ role: "member", memberId: member.id, name: member.name });
+        }
+      }
+      fail();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const verifyCode = async () => {
+    setBusy(true);
+    const good = credentials.adminRecoveryHash && (await hashRecovery(codeInput)) === credentials.adminRecoveryHash;
+    setBusy(false);
+    if (good) { setError(""); go("newpass"); } else setError("That recovery code doesn't match.");
+  };
+  const saveNewPassword = async () => {
+    if (np.next.length < 4) return setError("Use at least 4 characters.");
+    if (np.next !== np.confirm) return setError("Passwords don't match.");
+    setBusy(true);
+    const { adminPassword, ...rest } = credentials;
+    setCredentials({ ...rest, adminPasswordHash: await hashPassword(credentials.adminUsername, np.next) });
+    localStorage.removeItem(FAIL_KEY);
+    onLogin({ role: "admin" });
+  };
+
+  if (view === "newpass") {
+    return (
+      <AuthShell>
+        <AuthHeading title="Choose a new password" subtitle={`For admin “${credentials.adminUsername}”`} />
+        <div className="flex flex-col gap-2 mb-2">
+          <PasswordField autoFocus placeholder="New password" value={np.next} onChange={(e) => { setNp({ ...np, next: e.target.value }); setError(""); }} />
+          <PasswordField placeholder="Confirm new password" value={np.confirm} onChange={(e) => { setNp({ ...np, confirm: e.target.value }); setError(""); }} onKeyDown={(e) => e.key === "Enter" && saveNewPassword()} />
+        </div>
+        <div style={{ minHeight: 20, color: T.neg, fontSize: 12.5, marginBottom: 6 }}>{error}</div>
+        <PrimaryButton disabled={busy} onClick={saveNewPassword}>Save &amp; log in</PrimaryButton>
+        <div className="text-center mt-3"><LinkButton onClick={() => go("login")}>Cancel</LinkButton></div>
+      </AuthShell>
+    );
+  }
+
+  if (view === "forgot") {
+    return (
+      <AuthShell>
+        <AuthHeading title="Forgot your password?" />
+        <Segmented value={forgotAs} onChange={(v) => { setForgotAs(v); setError(""); }} options={[{ id: "admin", label: "I'm the admin" }, { id: "member", label: "I'm a housemate" }]} />
+        <div style={{ height: 14 }} />
+        {forgotAs === "member" ? (
+          <div style={{ background: T.soft, borderRadius: 12, padding: 12, color: T.text2, fontSize: 12.5, lineHeight: 1.55 }}>
+            Ask your house admin to set a new password for you: <strong>Household tab → your card → Login → Save</strong>. You can then change it yourself in Settings.
+          </div>
+        ) : credentials.adminRecoveryHash ? (
+          <>
+            <div style={{ color: T.muted, fontSize: 12.5, lineHeight: 1.5, marginBottom: 10 }}>Enter the recovery code you saved when you set up the admin login.</div>
+            <FieldInput autoFocus className="mono" placeholder="XXXX-XXXX-XXXX-XXXX" value={codeInput} onChange={(e) => { setCodeInput(formatRecovery(e.target.value)); setError(""); }} onKeyDown={(e) => e.key === "Enter" && verifyCode()} style={{ width: "100%", textAlign: "center", letterSpacing: 1.5, fontSize: 15, padding: "12px 10px" }} />
+            <div style={{ minHeight: 22, color: T.neg, fontSize: 12.5, margin: "8px 0" }}>{error}</div>
+            <PrimaryButton disabled={busy || codeInput.length < 19} onClick={verifyCode}>Verify code</PrimaryButton>
+          </>
+        ) : (
+          <div style={{ background: T.soft, borderRadius: 12, padding: 12, color: T.text2, fontSize: 12.5, lineHeight: 1.55 }}>
+            No recovery code was created for the admin login, so it can't be reset. Your only option is to erase everything and start fresh.
+          </div>
+        )}
+        <div className="flex justify-between mt-4">
+          <LinkButton onClick={() => go("login")}>Back</LinkButton>
+          {forgotAs === "admin" && <LinkButton onClick={() => go("erase")} style={{ color: T.neg }}>Erase data &amp; start over</LinkButton>}
+        </div>
+      </AuthShell>
+    );
+  }
+
+  if (view === "erase") {
+    return (
+      <AuthShell>
+        <AuthHeading title="Erase everything?" />
+        <div style={{ color: T.text2, fontSize: 12.5, lineHeight: 1.55, marginBottom: 12 }}>
+          This permanently deletes the pantry, shopping list, budget, history, housemates and all logins for everyone, then lets you set up a new admin. It can't be undone.
+        </div>
+        <FieldInput placeholder="Type ERASE to confirm" value={eraseText} onChange={(e) => setEraseText(e.target.value)} style={{ width: "100%", marginBottom: 12 }} />
+        <PrimaryButton disabled={eraseText !== "ERASE" || busy} style={{ background: T.neg }} onClick={async () => { setBusy(true); await onErase(); }}>{busy ? "Erasing…" : "Erase all data"}</PrimaryButton>
+        <div className="text-center mt-3"><LinkButton onClick={() => go("forgot")}>Cancel</LinkButton></div>
+      </AuthShell>
+    );
+  }
+
+  return (
+    <AuthShell>
+      <AuthHeading title="Welcome back" subtitle="Log in to your household" />
+      <div className={`flex flex-col gap-2 mb-2 ${shake ? "shake" : ""}`}>
+        <FieldInput autoFocus placeholder="Username" autoCapitalize="none" autoCorrect="off" value={username} onChange={(e) => { setUsername(e.target.value); setError(""); }} />
+        <PasswordField value={password} onChange={(e) => { setPassword(e.target.value); setError(""); }} onKeyDown={(e) => e.key === "Enter" && submit()} />
+      </div>
+      <div style={{ minHeight: 22, color: T.neg, fontSize: 12.5, margin: "6px 0" }}>{locked ? `Locked for ${secsLeft}s — try again soon.` : error}</div>
+      <PrimaryButton disabled={locked || busy || !username.trim() || !password} onClick={submit}>Log in</PrimaryButton>
+      <div className="text-center mt-3"><LinkButton onClick={() => go("forgot")}>Forgot password?</LinkButton></div>
+      <div style={{ color: T.faint, fontSize: 11.5, textAlign: "center", marginTop: 10 }}>Need a login? Ask your house admin.</div>
+    </AuthShell>
+  );
+}
+
+function SettingsModal({ prefs, setPrefs, isAdmin, displayName, onSaveName, hasRecovery, canExport, onChangePassword, onCreateRecovery, onBackup, onRestore, onExportCsv, onErase, onLogout, onClose }) {
+  const [nameDraft, setNameDraft] = useState(isAdmin ? displayName : "");
+  const [nameSaved, setNameSaved] = useState(false);
+  const [pw, setPw] = useState({ cur: "", next: "", confirm: "" });
+  const [pwMsg, setPwMsg] = useState(null);
+  const [newCode, setNewCode] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [restoreMsg, setRestoreMsg] = useState(null);
+  const [eraseOpen, setEraseOpen] = useState(false);
+  const [eraseText, setEraseText] = useState("");
+  const fileRef = useRef(null);
+
+  const savePw = async () => {
+    if (pw.next.length < 4) return setPwMsg({ ok: false, text: "New password needs at least 4 characters." });
+    if (pw.next !== pw.confirm) return setPwMsg({ ok: false, text: "New passwords don't match." });
+    const err = await onChangePassword(pw.cur, pw.next);
+    if (err) return setPwMsg({ ok: false, text: err });
+    setPw({ cur: "", next: "", confirm: "" });
+    setPwMsg({ ok: true, text: "Password updated." });
+  };
+  const copyCode = async () => {
+    try { await navigator.clipboard.writeText(newCode); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch { /* best effort */ }
+  };
+  const pickFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (file) setRestoreMsg(await onRestore(file));
+  };
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: T.scrim, zIndex: 1200, display: "flex", alignItems: "flex-end", justifyContent: "center" }} className="sm:items-center sm:p-4">
+      <div onClick={(e) => e.stopPropagation()} className="sheet-in" style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: "22px 22px 0 0", padding: 20, width: "100%", maxWidth: 460, maxHeight: "90vh", overflowY: "auto", boxShadow: T.shadow }}>
+        <div className="flex items-center justify-between mb-4">
+          <div className="font-display" style={{ fontWeight: 800, fontSize: 18, color: T.ink }}>Settings</div>
+          <button onClick={onClose} aria-label="Close" style={{ color: T.muted }}><X size={18} /></button>
+        </div>
+
+        {isAdmin && (
+          <SettingsSection title="Profile">
+            <div className="flex gap-2">
+              <FieldInput placeholder="Your name" value={nameDraft} maxLength={30} onChange={(e) => { setNameDraft(e.target.value); setNameSaved(false); }} onKeyDown={(e) => e.key === "Enter" && (onSaveName(nameDraft), setNameSaved(true))} style={{ flex: 1, minWidth: 0 }} />
+              <SoftButton onClick={() => { onSaveName(nameDraft); setNameSaved(true); }} disabled={!nameDraft.trim() || nameDraft.trim() === displayName}>{nameSaved ? "Saved" : "Save"}</SoftButton>
+            </div>
+          </SettingsSection>
+        )}
+
+        <SettingsSection title="Appearance & privacy">
+          <Segmented value={prefs.theme} onChange={(theme) => setPrefs({ theme })} options={[{ id: "auto", label: "Auto" }, { id: "light", label: "Sage light" }, { id: "dark", label: "Forest night" }]} />
+          <SettingsRow label="Hide amounts" hint="Masks money values on this device"><Switch on={prefs.hide} onChange={(hide) => setPrefs({ hide })} /></SettingsRow>
+          <SettingsRow label="Auto log-out" hint="Log out after you've been idle">
+            <FieldSelect value={prefs.autoLockMin} onChange={(e) => setPrefs({ autoLockMin: Number(e.target.value) })} style={{ width: 110 }}>
+              <option value={0}>Never</option><option value={5}>5 min</option><option value={15}>15 min</option><option value={30}>30 min</option><option value={60}>1 hour</option>
+            </FieldSelect>
+          </SettingsRow>
+        </SettingsSection>
+
+        <SettingsSection title="Security">
+          <div className="flex flex-col gap-2">
+            <PasswordField placeholder="Current password" value={pw.cur} onChange={(e) => setPw({ ...pw, cur: e.target.value })} />
+            <div className="grid grid-cols-2 gap-2">
+              <PasswordField placeholder="New password" value={pw.next} onChange={(e) => setPw({ ...pw, next: e.target.value })} />
+              <PasswordField placeholder="Confirm" value={pw.confirm} onChange={(e) => setPw({ ...pw, confirm: e.target.value })} />
+            </div>
+            {pwMsg && <div style={{ fontSize: 12.5, color: pwMsg.ok ? T.pos : T.neg }}>{pwMsg.text}</div>}
+            <SoftButton onClick={savePw} disabled={!pw.cur || !pw.next}><KeyRound size={14} /> Change password</SoftButton>
+          </div>
+          {isAdmin && (
+            <>
+              <SettingsRow label="Admin recovery code" hint={hasRecovery ? "Set — lets you reset a forgotten password" : "Not set — a forgotten admin password can't be reset"}>
+                <span style={{ fontSize: 11.5, fontWeight: 700, color: hasRecovery ? T.pos : T.warn }}>{hasRecovery ? "Active" : "Missing"}</span>
+              </SettingsRow>
+              {newCode ? (
+                <div style={{ background: T.soft, borderRadius: 12, padding: 12 }}>
+                  <div className="mono" style={{ textAlign: "center", fontSize: 16, fontWeight: 700, letterSpacing: 1.5, color: T.ink, userSelect: "all" }}>{newCode}</div>
+                  <div style={{ fontSize: 11.5, color: T.muted, margin: "8px 0", lineHeight: 1.45 }}>Save this now — it won't be shown again, and any older code no longer works.</div>
+                  <SoftButton onClick={copyCode} style={{ width: "100%" }}><Copy size={14} /> {copied ? "Copied!" : "Copy code"}</SoftButton>
+                </div>
+              ) : (
+                <SoftButton onClick={async () => setNewCode(await onCreateRecovery())}><ShieldCheck size={14} /> {hasRecovery ? "Generate a new recovery code" : "Create recovery code"}</SoftButton>
+              )}
+            </>
+          )}
+          <SoftButton onClick={onLogout}><LogOut size={14} /> Log out</SoftButton>
+        </SettingsSection>
+
+        {(isAdmin || canExport) && (
+          <SettingsSection title="Your data">
+            {isAdmin && (
+              <>
+                <div className="grid grid-cols-2 gap-2">
+                  <SoftButton onClick={onBackup}><Download size={14} /> Backup</SoftButton>
+                  <SoftButton onClick={() => fileRef.current?.click()}><Upload size={14} /> Restore</SoftButton>
+                </div>
+                <input ref={fileRef} type="file" accept="application/json,.json" onChange={pickFile} style={{ display: "none" }} />
+                {restoreMsg && <div style={{ fontSize: 12.5, color: restoreMsg.ok ? T.pos : T.neg }}>{restoreMsg.text}</div>}
+              </>
+            )}
+            {canExport && <SoftButton onClick={onExportCsv}><FileSpreadsheet size={14} /> Export budget ledger (CSV)</SoftButton>}
+            {isAdmin && <div style={{ fontSize: 11.5, color: T.muted, lineHeight: 1.45 }}>Backups are plain JSON files — keep them private. Restoring replaces the pantry, budget and housemates; logins are kept.</div>}
+          </SettingsSection>
+        )}
+
+        {isAdmin && (
+          <SettingsSection title="Danger zone">
+            {!eraseOpen ? (
+              <SoftButton danger onClick={() => setEraseOpen(true)}><Trash2 size={14} /> Erase all data…</SoftButton>
+            ) : (
+              <div className="flex flex-col gap-2">
+                <div style={{ fontSize: 12.5, color: T.text2, lineHeight: 1.5 }}>This deletes everything for the whole household, including all logins. Download a backup first.</div>
+                <FieldInput placeholder="Type ERASE to confirm" value={eraseText} onChange={(e) => setEraseText(e.target.value)} />
+                <SoftButton danger disabled={eraseText !== "ERASE"} onClick={onErase}>Erase everything</SoftButton>
+              </div>
+            )}
+          </SettingsSection>
+        )}
       </div>
     </div>
   );
 }
 
-function AdminSetup({ credentials, setCredentials, onDone }) {
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("");
-  const [confirm, setConfirm] = useState("");
-  const [error, setError] = useState("");
+// ---- Overview (Home) tab -------------------------------------------------------
 
-  const submit = () => {
-    if (!username.trim() || !password) { setError("Enter a username and password."); return; }
-    if (password !== confirm) { setError("Passwords don't match."); return; }
-    setCredentials({ ...credentials, adminUsername: username.trim(), adminPassword: password });
-    onDone();
-  };
+function OverviewTab({ pantry, shoppingExtra, tx, activity, members, poolBalance, totalContributed, totalSpent, canSeeBudget, canSeePeople, setTab }) {
+  const lowItems = pantry.filter((i) => i.qty <= i.lowThreshold).sort((a, b) => (a.qty - a.lowThreshold) - (b.qty - b.lowThreshold));
+  const outCount = pantry.filter((i) => i.qty <= 0).length;
+  const toBuy = lowItems.length + shoppingExtra.length;
+  const debts = canSeeBudget ? computePeerDebts(tx) : [];
+  const recent = activity.filter((a) => (a.scope === "budget" ? canSeeBudget : a.scope === "people" ? canSeePeople : true)).slice(0, 5);
+  const pct = totalContributed > 0 ? Math.max(0, Math.min(100, Math.round((poolBalance / totalContributed) * 100))) : 0;
+  const targetTotal = members.reduce((s, m) => s + (m.contribution || 0), 0);
+
+  const heroChips = canSeeBudget
+    ? [{ label: "Paid in", value: money(totalContributed) }, { label: "Spent", value: money(totalSpent) }, { label: "Left", value: `${pct}%` }]
+    : [{ label: "Items", value: pantry.length }, { label: "Low", value: lowItems.length }, { label: "Out", value: outCount }];
+
+  const tiles = [
+    { label: "Running low", value: lowItems.length, hint: lowItems.length ? "need restocking" : "all stocked", icon: AlertTriangle, tone: lowItems.length ? T.warn : T.pos, go: "pantry" },
+    { label: "Out of stock", value: outCount, hint: outCount ? "none left" : "nothing missing", icon: Package, tone: outCount ? T.neg : T.pos, go: "pantry" },
+    { label: "To buy", value: toBuy, hint: shoppingExtra.length ? `${shoppingExtra.length} extra on list` : "from low stock", icon: ShoppingCart, go: "shopping" },
+    ...(canSeeBudget && targetTotal > 0 ? [{ label: "Monthly goal", value: `${Math.min(999, Math.round((totalContributed / targetTotal) * 100))}%`, hint: `of ${money(targetTotal)} collected`, icon: Target, go: "budget" }] : [{ label: "Pantry items", value: pantry.length, hint: "tracked", icon: ShoppingBasket, go: "pantry" }]),
+  ];
 
   return (
-    <AuthShell>
-      <h1 className="font-display" style={{ color: "#1F2A1D", fontSize: 22, fontWeight: 800, marginBottom: 6 }}>Set up admin login</h1>
-      <div style={{ color: "#8A9186", fontSize: 13, marginBottom: 18 }}>
-        You're the first one here — set an admin username and password. You'll use this to assign logins to your housemates.
+    <div className="flex flex-col gap-4">
+      <div className="fade-up" style={{ background: `linear-gradient(135deg, ${T.heroA}, ${T.heroB})`, borderRadius: 20, padding: 20, color: "#fff", boxShadow: T.shadow }}>
+        <div style={{ fontSize: 11.5, opacity: 0.8, letterSpacing: 0.8, textTransform: "uppercase" }}>{canSeeBudget ? "Pool balance" : "Pantry today"}</div>
+        <div className="font-display" style={{ fontSize: 32, fontWeight: 800, letterSpacing: -0.8, margin: "2px 0 14px" }}>
+          {canSeeBudget ? money(poolBalance) : lowItems.length === 0 ? "All stocked 🎉" : `${lowItems.length} running low`}
+        </div>
+        {canSeeBudget && (
+          <div style={{ background: "rgba(255,255,255,0.18)", borderRadius: 99, height: 6, overflow: "hidden", marginBottom: 12 }}>
+            <div style={{ width: `${pct}%`, background: "#fff", height: "100%", borderRadius: 99, transition: "width .4s ease" }} />
+          </div>
+        )}
+        <div className="grid grid-cols-3 gap-2">
+          {heroChips.map(({ label, value }) => (
+            <div key={label} style={{ background: "rgba(255,255,255,0.14)", borderRadius: 12, padding: "9px 10px", minWidth: 0 }}>
+              <div style={{ fontSize: 10.5, opacity: 0.85, textTransform: "uppercase", letterSpacing: 0.5 }}>{label}</div>
+              <div className="font-display" style={{ fontSize: 14.5, fontWeight: 700, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</div>
+            </div>
+          ))}
+        </div>
       </div>
-      <div className="flex flex-col gap-2 mb-3">
-        <FieldInput placeholder="Admin username" value={username} onChange={e => setUsername(e.target.value)} />
-        <FieldInput type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} />
-        <FieldInput type="password" placeholder="Confirm password" value={confirm} onChange={e => setConfirm(e.target.value)} />
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {tiles.map(({ label, value, hint, icon: Icon, tone, go }) => (
+          <button key={label} onClick={() => setTab(go)} className="card-hover fade-up" style={{ textAlign: "left", background: T.card, border: `1px solid ${T.line}`, borderRadius: 16, padding: 12, boxShadow: T.shadow, minWidth: 0 }}>
+            <div className="flex items-center gap-1.5" style={{ color: T.muted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}><Icon size={12} /> {label}</div>
+            <div className="font-display" style={{ color: tone || T.ink, fontSize: 22, fontWeight: 800, marginTop: 4 }}>{value}</div>
+            <div style={{ color: T.muted, fontSize: 11.5, marginTop: 1 }}>{hint}</div>
+          </button>
+        ))}
       </div>
-      {error && <div style={{ color: "#C05C4A", fontSize: 12, marginBottom: 10 }}>{error}</div>}
-      <button onClick={submit} className="w-full" style={{ background: "#1F2A1D", color: "#F7F8F5", borderRadius: 10, padding: "12px 16px", fontWeight: 700, fontSize: 13.5 }}>
-        Create admin account
-      </button>
-      <div style={{ color: "#B4BAAD", fontSize: 11, marginTop: 12, lineHeight: 1.5 }}>
-        Note: this is a simple household-level login, not encrypted bank-grade security — good for keeping casual housemates out, not for protecting sensitive data.
+
+      <div className="grid sm:grid-cols-2 gap-4">
+        <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 16, padding: 16, boxShadow: T.shadow }}>
+          <div className="flex items-center justify-between mb-3">
+            <div className="font-display" style={{ fontWeight: 700, fontSize: 14, color: T.ink }}>Needs attention</div>
+            <button onClick={() => setTab("pantry")} style={{ fontSize: 11.5, color: T.muted, textDecoration: "underline" }}>open pantry</button>
+          </div>
+          {lowItems.length === 0 ? (
+            <div style={{ color: T.faint, fontSize: 12.5 }}>Nothing is running low. Nice.</div>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {lowItems.slice(0, 6).map((i) => {
+                const out = i.qty <= 0;
+                return (
+                  <div key={i.id} className="flex items-center justify-between" style={{ fontSize: 12.5 }}>
+                    <span style={{ color: T.ink }}>{i.name}</span>
+                    <span style={{ color: out ? T.neg : T.warn, fontWeight: 700 }}>{out ? "out of stock" : `${i.qty} ${i.unit} left`}</span>
+                  </div>
+                );
+              })}
+              {lowItems.length > 6 && <div style={{ color: T.muted, fontSize: 11.5 }}>+{lowItems.length - 6} more</div>}
+            </div>
+          )}
+        </div>
+
+        <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 16, padding: 16, boxShadow: T.shadow }}>
+          <div className="flex items-center justify-between mb-3">
+            <div className="font-display" style={{ fontWeight: 700, fontSize: 14, color: T.ink }}>{canSeeBudget ? "Who owes whom" : "Latest activity"}</div>
+            <button onClick={() => setTab(canSeeBudget ? "budget" : "activity")} style={{ fontSize: 11.5, color: T.muted, textDecoration: "underline" }}>{canSeeBudget ? "open budget" : "see all"}</button>
+          </div>
+          {canSeeBudget ? (
+            debts.length === 0 ? (
+              <div style={{ color: T.faint, fontSize: 12.5 }}>Everyone is square.</div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {debts.slice(0, 5).map((d, i) => (
+                  <div key={i} className="flex items-center justify-between" style={{ fontSize: 12.5 }}>
+                    <span style={{ color: T.ink }}>{d.from} <span style={{ color: T.muted }}>owes</span> {d.to}</span>
+                    <span style={{ color: T.neg, fontWeight: 700 }}>{money(d.amount)}</span>
+                  </div>
+                ))}
+              </div>
+            )
+          ) : recent.length === 0 ? (
+            <div style={{ color: T.faint, fontSize: 12.5 }}>No activity yet.</div>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {recent.map((a) => (
+                <div key={a.id} style={{ fontSize: 12.5 }}><span style={{ color: T.ink, fontWeight: 600 }}>{a.actor}</span> <span style={{ color: T.text2 }}>{a.message}</span></div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
-    </AuthShell>
+
+      {canSeeBudget && recent.length > 0 && (
+        <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 16, padding: 16, boxShadow: T.shadow }}>
+          <div className="flex items-center justify-between mb-3">
+            <div className="font-display" style={{ fontWeight: 700, fontSize: 14, color: T.ink }}>Latest activity</div>
+            <button onClick={() => setTab("activity")} style={{ fontSize: 11.5, color: T.muted, textDecoration: "underline" }}>see all</button>
+          </div>
+          <div className="flex flex-col gap-2">
+            {recent.map((a) => (
+              <div key={a.id} className="flex items-center justify-between gap-3" style={{ fontSize: 12.5 }}>
+                <span style={{ minWidth: 0 }}><span style={{ color: T.ink, fontWeight: 600 }}>{a.actor}</span> <span style={{ color: T.text2 }}>{a.message}</span></span>
+                <span style={{ color: T.faint, fontSize: 11, whiteSpace: "nowrap" }}>{timeAgo(a.date)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
-function LoginScreen({ credentials, members, onLogin }) {
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
-
-  const submit = () => {
-    if (username.trim() === credentials.adminUsername && password === credentials.adminPassword) {
-      onLogin({ role: "admin" });
-      return;
-    }
-    const entry = Object.entries(credentials.users || {}).find(
-      ([, cred]) => cred.username === username.trim() && cred.password === password
-    );
-    if (entry) {
-      const [memberId] = entry;
-      const member = members.find(m => m.id === memberId);
-      if (member) {
-        onLogin({ role: "member", memberId: member.id, name: member.name });
-        return;
-      }
-    }
-    setError("Incorrect username or password.");
-  };
-
-  return (
-    <AuthShell>
-      <h1 className="font-display" style={{ color: "#1F2A1D", fontSize: 22, fontWeight: 800, marginBottom: 6 }}>Log in</h1>
-      <div style={{ color: "#8A9186", fontSize: 13, marginBottom: 18 }}>
-        Ask your admin for a username and password if you don't have one yet.
-      </div>
-      <div className="flex flex-col gap-2 mb-3">
-        <FieldInput placeholder="Username" value={username} onChange={e => setUsername(e.target.value)} />
-        <FieldInput type="password" placeholder="Password" value={password} onChange={e => { setPassword(e.target.value); setError(""); }} onKeyDown={e => e.key === "Enter" && submit()} />
-      </div>
-      {error && <div style={{ color: "#C05C4A", fontSize: 12, marginBottom: 10 }}>{error}</div>}
-      <button onClick={submit} className="w-full" style={{ background: "#1F2A1D", color: "#F7F8F5", borderRadius: 10, padding: "12px 16px", fontWeight: 700, fontSize: 13.5 }}>
-        Log in
-      </button>
-    </AuthShell>
-  );
-}
 
 function StatCard({ label, value, color }) {
   return (<div>
-      <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
-      <div className="font-display" style={{ color: color || "#1F2A1D", fontSize: 20, fontWeight: 700 }}>{value}</div>
+      <div style={{ color: T.muted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
+      <div className="font-display" style={{ color: color || T.ink, fontSize: 20, fontWeight: 700 }}>{value}</div>
     </div>
   );
 }
 
 function EmptyState({ icon: Icon, text }) {
   return (
-    <div className="flex flex-col items-center justify-center py-16 gap-2" style={{ color: "#B4BAAD", gridColumn: "1 / -1" }}>
+    <div className="flex flex-col items-center justify-center py-16 gap-2" style={{ color: T.faint, gridColumn: "1 / -1" }}>
       <Icon size={24} />
       <div style={{ fontSize: 13 }}>{text}</div>
     </div>
@@ -563,7 +1290,7 @@ function FieldInput(props) {
   return (
     <input
       {...props}
-      style={{ background: "#F7F8F5", color: "#1F2A1D", border: "1px solid #E7E9E2", borderRadius: 8, fontSize: 13, padding: "8px 10px", ...props.style }}
+      style={{ background: T.bg, color: T.ink, border: `1px solid ${T.line}`, borderRadius: 8, fontSize: 13, padding: "8px 10px", ...props.style }}
     />
   );
 }
@@ -571,7 +1298,7 @@ function FieldSelect(props) {
   return (
     <select
       {...props}
-      style={{ background: "#F7F8F5", color: "#1F2A1D", border: "1px solid #E7E9E2", borderRadius: 8, fontSize: 13, padding: "8px 10px", ...props.style }}
+      style={{ background: T.bg, color: T.ink, border: `1px solid ${T.line}`, borderRadius: 8, fontSize: 13, padding: "8px 10px", ...props.style }}
     />
   );
 }
@@ -662,7 +1389,7 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
 
     if (editing) {
       return (
-        <div key={item.id} style={{ background: "#FFFFFF", border: "1px solid #4C8B5C", borderRadius: 14, overflow: "hidden", boxShadow: "0 2px 8px rgba(31,42,29,0.06)" }}>
+        <div key={item.id} style={{ background: T.card, border: `1px solid ${T.pos}`, borderRadius: 14, overflow: "hidden", boxShadow: T.shadow }}>
           <div style={{ height: 5, background: cat.color }} />
           <div style={{ padding: "12px 14px" }} className="flex flex-col gap-1.5">
             <FieldInput value={editForm.name} onChange={e => setEditForm({ ...editForm, name: e.target.value })} style={{ fontSize: 13 }} />
@@ -676,14 +1403,14 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
               </FieldSelect>
             </div>
             <div className="flex items-center gap-1.5">
-              <label style={{ color: "#8A9186", fontSize: 11 }}>Alert below</label>
+              <label style={{ color: T.muted, fontSize: 11 }}>Alert below</label>
               <FieldInput type="number" min="0" step="any" className="w-16" value={editForm.lowThreshold} onChange={e => setEditForm({ ...editForm, lowThreshold: e.target.value })} style={{ fontSize: 12 }} />
             </div>
             <div className="flex gap-1.5 mt-1">
-              <button onClick={saveEdit} className="flex-1 flex items-center justify-center gap-1" style={{ background: "#4C8B5C", color: "#fff", borderRadius: 8, padding: "6px 0", fontSize: 12, fontWeight: 600 }}>
+              <button onClick={saveEdit} className="flex-1 flex items-center justify-center gap-1" style={{ background: T.pos, color: "#fff", borderRadius: 8, padding: "6px 0", fontSize: 12, fontWeight: 600 }}>
                 <Check size={12} /> Save
               </button>
-              <button onClick={cancelEdit} style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", color: "#4A5247", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 600 }}>
+              <button onClick={cancelEdit} style={{ background: T.bg, border: `1px solid ${T.line}`, color: T.text2, borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 600 }}>
                 Cancel
               </button>
             </div>
@@ -693,7 +1420,7 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
     }
 
     return (
-      <div key={item.id} className="card-hover" style={{ background: "#FFFFFF", border: `1px solid ${low ? "#F0C4B8" : "#E7E9E2"}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+      <div key={item.id} className="card-hover" style={{ background: T.card, border: `1px solid ${low ? T.neg + "55" : T.line}`, borderRadius: 14, overflow: "hidden", boxShadow: T.shadow }}>
         <div style={{ height: 5, background: cat.color }} />
         <div style={{ padding: "12px 14px" }}>
           <div className="flex items-start justify-between mb-2">
@@ -702,31 +1429,31 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
             </div>
             {isAdmin && (
               <div className="flex items-center gap-0.5">
-                <button onClick={() => startEdit(item)} style={{ color: "#B4BAAD", padding: 2 }}>
+                <button onClick={() => startEdit(item)} style={{ color: T.faint, padding: 2 }}>
                   <Pencil size={12} />
                 </button>
-                <button onClick={() => removeItem(item)} style={{ color: "#C6CBC0", padding: 2 }}>
+                <button onClick={() => removeItem(item)} style={{ color: T.faint, padding: 2 }}>
                   <Trash2 size={13} />
                 </button>
               </div>
             )}
           </div>
-          <div style={{ color: "#1F2A1D", fontSize: 14, fontWeight: 600, marginBottom: 1 }}>{item.name}</div>
-          <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 10 }}>{item.category}</div>
+          <div style={{ color: T.ink, fontSize: 14, fontWeight: 600, marginBottom: 1 }}>{item.name}</div>
+          <div style={{ color: T.muted, fontSize: 11, marginBottom: 10 }}>{item.category}</div>
           {low && (
-            <div className="flex items-center gap-1 mb-2" style={{ color: "#C05C4A", fontSize: 11, fontWeight: 600 }}>
+            <div className="flex items-center gap-1 mb-2" style={{ color: T.neg, fontSize: 11, fontWeight: 600 }}>
               <AlertTriangle size={11} /> {item.qty === 0 ? "Out of stock" : "Running low"}
             </div>
           )}
           <div className="flex items-center justify-between">
-            <button onClick={() => adjustQty(item, -1)} style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", borderRadius: 7, padding: 5 }}>
-              <Minus size={12} color="#4A5247" />
+            <button onClick={() => adjustQty(item, -1)} style={{ background: T.bg, border: `1px solid ${T.line}`, borderRadius: 7, padding: 5 }}>
+              <Minus size={12} color={T.text2} />
             </button>
-            <span className="font-display" style={{ color: low ? "#C05C4A" : "#1F2A1D", fontSize: 14, fontWeight: 700 }}>
-              {item.qty} <span style={{ fontSize: 11, fontWeight: 500, color: "#8A9186" }}>{item.unit}</span>
+            <span className="font-display" style={{ color: low ? T.neg : T.ink, fontSize: 14, fontWeight: 700 }}>
+              {item.qty} <span style={{ fontSize: 11, fontWeight: 500, color: T.muted }}>{item.unit}</span>
             </span>
-            <button onClick={() => adjustQty(item, 1)} style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", borderRadius: 7, padding: 5 }}>
-              <Plus size={12} color="#4A5247" />
+            <button onClick={() => adjustQty(item, 1)} style={{ background: T.bg, border: `1px solid ${T.line}`, borderRadius: 7, padding: 5 }}>
+              <Plus size={12} color={T.text2} />
             </button>
           </div>
         </div>
@@ -737,12 +1464,12 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
   return (
     <div>
       <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-        <div style={{ color: "#4A5247", fontSize: 13 }}>{pantry.length} item{pantry.length !== 1 ? "s" : ""} on the shelf</div>
+        <div style={{ color: T.text2, fontSize: 13 }}>{pantry.length} item{pantry.length !== 1 ? "s" : ""} on the shelf</div>
         {isAdmin && (
           <button
             onClick={() => setAdding(a => !a)}
             className="flex items-center gap-1.5 px-3.5 py-2"
-            style={{ background: "#4C8B5C", color: "#fff", borderRadius: 10, fontSize: 13, fontWeight: 600 }}
+            style={{ background: T.pos, color: "#fff", borderRadius: 10, fontSize: 13, fontWeight: 600 }}
           >
             {adding ? <X size={14} /> : <Plus size={14} />}
             {adding ? "Cancel" : "Add item"}
@@ -752,7 +1479,7 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
 
       <div className="flex flex-col sm:flex-row gap-2 mb-4">
         <div style={{ position: "relative", flex: 1 }}>
-          <Search size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "#B4BAAD" }} />
+          <Search size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: T.faint }} />
           <FieldInput
             placeholder="Search pantry…"
             value={search}
@@ -769,9 +1496,9 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
                 onClick={() => setCategoryFilter(c)}
                 className="px-2.5 py-1.5"
                 style={{
-                  background: active ? "#1F2A1D" : "#FFFFFF",
-                  color: active ? "#fff" : "#4A5247",
-                  border: `1px solid ${active ? "#1F2A1D" : "#E7E9E2"}`,
+                  background: active ? T.ink : T.card,
+                  color: active ? "#fff" : T.text2,
+                  border: `1px solid ${active ? T.ink : T.line}`,
                   borderRadius: 8, fontSize: 11.5, fontWeight: 600, whiteSpace: "nowrap",
                 }}
               >
@@ -783,7 +1510,7 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
       </div>
 
       {adding && isAdmin && (
-        <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+        <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: T.shadow }}>
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
             <FieldInput className="col-span-2 sm:col-span-2" placeholder="Item name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
             <FieldSelect value={form.category} onChange={e => setForm({ ...form, category: e.target.value })}>
@@ -795,9 +1522,9 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
             </FieldSelect>
           </div>
           <div className="flex items-center gap-2 mt-2.5">
-            <label style={{ color: "#8A9186", fontSize: 12 }}>Alert when below</label>
+            <label style={{ color: T.muted, fontSize: 12 }}>Alert when below</label>
             <FieldInput type="number" min="0" step="any" className="w-16" value={form.lowThreshold} onChange={e => setForm({ ...form, lowThreshold: e.target.value })} />
-            <button onClick={addItem} className="ml-auto px-4 py-2" style={{ background: "#1F2A1D", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
+            <button onClick={addItem} className="ml-auto px-4 py-2" style={{ background: T.pos, color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
               Add to shelf
             </button>
           </div>
@@ -806,7 +1533,7 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
 
       {lowItems.length > 0 && (
         <div className="mb-6">
-          <div className="flex items-center gap-1.5 mb-2" style={{ color: "#C05C4A", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5 }}>
+          <div className="flex items-center gap-1.5 mb-2" style={{ color: T.neg, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5 }}>
             <AlertTriangle size={12} /> Running low ({lowItems.length})
           </div>
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
@@ -821,7 +1548,7 @@ function PantryTab({ pantry, setPantry, isAdmin, logActivity }) {
         <div className="flex flex-col gap-6">
           {grouped.map(({ cat, items }) => (
             <div key={cat}>
-              <div className="font-mono mb-2" style={{ color: "rgba(31,42,29,0.35)", fontSize: 11, letterSpacing: 1.5, textTransform: "uppercase" }}>
+              <div className="font-mono mb-2" style={{ color: T.faint, fontSize: 11, letterSpacing: 1.5, textTransform: "uppercase" }}>
                 {cat}
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
@@ -878,11 +1605,11 @@ function ShoppingTab({ pantry, setPantry, shoppingExtra, setShoppingExtra, actor
 
   return (
     <div>
-      <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+      <div style={{ color: T.muted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
         From your pantry ({lowItems.length})
       </div>
       {lowItems.length === 0 ? (
-        <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 24, color: "#8A9186", fontSize: 13 }}>
+        <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginBottom: 24, color: T.muted, fontSize: 13 }}>
           Nothing running low right now — the pantry's in good shape.
         </div>
       ) : (
@@ -891,18 +1618,18 @@ function ShoppingTab({ pantry, setPantry, shoppingExtra, setShoppingExtra, actor
             const cat = catInfo(item.category);
             const Icon = cat.icon;
             return (
-              <div key={item.id} className="card-hover flex items-center gap-3 flex-wrap" style={{ background: "#FFFFFF", border: "1px solid #F0C4B8", borderRadius: 12, padding: "10px 12px", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+              <div key={item.id} className="card-hover flex items-center gap-3 flex-wrap" style={{ background: T.card, border: `1px solid ${T.neg}55`, borderRadius: 12, padding: "10px 12px", boxShadow: T.shadow }}>
                 <div style={{ width: 30, height: 30, borderRadius: 8, background: cat.color + "1A", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                   <Icon size={15} color={cat.color} />
                 </div>
                 <div style={{ flex: 1, minWidth: 100 }}>
-                  <div style={{ color: "#1F2A1D", fontSize: 13.5, fontWeight: 600 }}>{item.name}</div>
-                  <div style={{ color: "#C05C4A", fontSize: 11 }}>{item.qty === 0 ? "Out of stock" : `${item.qty} ${item.unit} left`}</div>
+                  <div style={{ color: T.ink, fontSize: 13.5, fontWeight: 600 }}>{item.name}</div>
+                  <div style={{ color: T.neg, fontSize: 11 }}>{item.qty === 0 ? "Out of stock" : `${item.qty} ${item.unit} left`}</div>
                 </div>
                 <div className="flex items-center gap-1.5">
                   <FieldInput type="number" min="0" step="any" value={amountFor(item)} onChange={e => setAmount(item.id, e.target.value)} className="w-16" style={{ padding: "5px 8px", fontSize: 12 }} />
-                  <span style={{ color: "#8A9186", fontSize: 11 }}>{item.unit}</span>
-                  <button onClick={() => markBought(item)} className="flex items-center gap-1" style={{ background: "#4C8B5C", color: "#fff", borderRadius: 7, padding: "6px 10px", fontSize: 11.5, fontWeight: 600 }}>
+                  <span style={{ color: T.muted, fontSize: 11 }}>{item.unit}</span>
+                  <button onClick={() => markBought(item)} className="flex items-center gap-1" style={{ background: T.pos, color: "#fff", borderRadius: 7, padding: "6px 10px", fontSize: 11.5, fontWeight: 600 }}>
                     <Check size={12} /> Bought
                   </button>
                 </div>
@@ -912,12 +1639,12 @@ function ShoppingTab({ pantry, setPantry, shoppingExtra, setShoppingExtra, actor
         </div>
       )}
 
-      <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+      <div style={{ color: T.muted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
         Other items to pick up
       </div>
       <div className="flex gap-2 mb-3">
         <FieldInput placeholder="e.g. birthday candles" value={extraText} onChange={e => setExtraText(e.target.value)} onKeyDown={e => e.key === "Enter" && addExtra()} style={{ flex: 1 }} />
-        <button onClick={addExtra} className="px-3.5 py-2" style={{ background: "#1F2A1D", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
+        <button onClick={addExtra} className="px-3.5 py-2" style={{ background: T.pos, color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
           Add
         </button>
       </div>
@@ -926,15 +1653,15 @@ function ShoppingTab({ pantry, setPantry, shoppingExtra, setShoppingExtra, actor
       ) : (
         <div className="flex flex-col gap-1.5">
           {shoppingExtra.map(item => (
-            <div key={item.id} className="flex items-center gap-3" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 10, padding: "8px 12px" }}>
+            <div key={item.id} className="flex items-center gap-3" style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 10, padding: "8px 12px" }}>
               <div style={{ flex: 1 }}>
-                <div style={{ color: "#1F2A1D", fontSize: 13 }}>{item.name}</div>
-                <div style={{ color: "#B4BAAD", fontSize: 10.5 }}>added by {item.addedBy}</div>
+                <div style={{ color: T.ink, fontSize: 13 }}>{item.name}</div>
+                <div style={{ color: T.faint, fontSize: 10.5 }}>added by {item.addedBy}</div>
               </div>
-              <button onClick={() => boughtExtra(item)} className="flex items-center gap-1" style={{ background: "#4C8B5C", color: "#fff", borderRadius: 7, padding: "5px 9px", fontSize: 11, fontWeight: 600 }}>
+              <button onClick={() => boughtExtra(item)} className="flex items-center gap-1" style={{ background: T.pos, color: "#fff", borderRadius: 7, padding: "5px 9px", fontSize: 11, fontWeight: 600 }}>
                 <Check size={11} /> Bought
               </button>
-              <button onClick={() => removeExtra(item)} style={{ color: "#C6CBC0", padding: 3 }}>
+              <button onClick={() => removeExtra(item)} style={{ color: T.faint, padding: 3 }}>
                 <Trash2 size={12} />
               </button>
             </div>
@@ -1062,32 +1789,32 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
     <div>
       <div className="flex items-start justify-between flex-wrap gap-2 mb-5">
         <div className="grid grid-cols-3 gap-3 flex-1">
-          <StatCard label="Contributed" value={money(totalContributed)} color="#4C8B5C" />
-          <StatCard label="Spent" value={money(totalSpent)} color="#C05C4A" />
-          <StatCard label="Balance" value={money(poolBalance)} color="#C79A3E" />
+          <StatCard label="Contributed" value={money(totalContributed)} color={T.pos} />
+          <StatCard label="Spent" value={money(totalSpent)} color={T.neg} />
+          <StatCard label="Balance" value={money(poolBalance)} color={T.warn} />
         </div>
       </div>
 
       {isAdmin && tx.length > 0 && (
-        <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 14, marginBottom: 20 }}>
+        <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: 14, marginBottom: 20 }}>
           {!confirmClose ? (
             <div className="flex items-center justify-between flex-wrap gap-2">
-              <div style={{ color: "#4A5247", fontSize: 12.5 }}>Done with {monthLabel}? Archive it and start a fresh ledger.</div>
-              <button onClick={() => setConfirmClose(true)} className="flex items-center gap-1.5 px-3 py-1.5" style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", color: "#4A5247", borderRadius: 8, fontSize: 12.5, fontWeight: 600 }}>
+              <div style={{ color: T.text2, fontSize: 12.5 }}>Done with {monthLabel}? Archive it and start a fresh ledger.</div>
+              <button onClick={() => setConfirmClose(true)} className="flex items-center gap-1.5 px-3 py-1.5" style={{ background: T.bg, border: `1px solid ${T.line}`, color: T.text2, borderRadius: 8, fontSize: 12.5, fontWeight: 600 }}>
                 <Archive size={13} /> Close out {monthLabel}
               </button>
             </div>
           ) : (
             <div>
-              <div style={{ color: "#1F2A1D", fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Archive {monthLabel} and start over?</div>
-              <div style={{ color: "#8A9186", fontSize: 12, marginBottom: 10 }}>
-                All {tx.length} entries move to History. Monthly targets stay the same for next month — only what's been paid resets to $0.
+              <div style={{ color: T.ink, fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Archive {monthLabel} and start over?</div>
+              <div style={{ color: T.muted, fontSize: 12, marginBottom: 10 }}>
+                All {tx.length} entries move to History. Monthly targets stay the same for next month — only what's been paid resets to ₹0.
               </div>
               <div className="flex gap-2">
-                <button onClick={() => { closeMonth(); setConfirmClose(false); }} className="px-3 py-1.5" style={{ background: "#C05C4A", color: "#fff", borderRadius: 8, fontSize: 12.5, fontWeight: 600 }}>
+                <button onClick={() => { closeMonth(); setConfirmClose(false); }} className="px-3 py-1.5" style={{ background: T.neg, color: "#fff", borderRadius: 8, fontSize: 12.5, fontWeight: 600 }}>
                   Yes, archive it
                 </button>
-                <button onClick={() => setConfirmClose(false)} className="px-3 py-1.5" style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", color: "#4A5247", borderRadius: 8, fontSize: 12.5, fontWeight: 600 }}>
+                <button onClick={() => setConfirmClose(false)} className="px-3 py-1.5" style={{ background: T.bg, border: `1px solid ${T.line}`, color: T.text2, borderRadius: 8, fontSize: 12.5, fontWeight: 600 }}>
                   Cancel
                 </button>
               </div>
@@ -1097,13 +1824,13 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
       )}
 
       {members.length === 0 ? (
-        <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, color: "#4A5247", fontSize: 13 }}>
+        <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginBottom: 20, color: T.text2, fontSize: 13 }}>
           Add housemates in the Household tab first — then you can log who paid what.
         </div>
       ) : (
         <>
           {isAdmin ? (
-          <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+          <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: T.shadow }}>
             <div className="flex gap-2 mb-3">
               {["expense", "contribution"].map(t => (
                 <button
@@ -1111,9 +1838,9 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
                   onClick={() => setForm({ ...form, type: t })}
                   className="px-3 py-1.5"
                   style={{
-                    background: form.type === t ? (t === "expense" ? "#C05C4A" : "#4C8B5C") : "#F7F8F5",
-                    color: form.type === t ? "#fff" : "#4A5247",
-                    border: "1px solid " + (form.type === t ? "transparent" : "#E7E9E2"),
+                    background: form.type === t ? (t === "expense" ? T.neg : T.pos) : T.bg,
+                    color: form.type === t ? "#fff" : T.text2,
+                    border: "1px solid " + (form.type === t ? "transparent" : T.line),
                     borderRadius: 8, fontSize: 12.5, fontWeight: 600,
                   }}
                 >
@@ -1132,9 +1859,9 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
                       onClick={() => setForm({ ...form, category: c.name })}
                       className="flex items-center gap-1 px-2.5 py-1.5"
                       style={{
-                        background: active ? c.color + "1A" : "#F7F8F5",
-                        color: active ? c.color : "#8A9186",
-                        border: `1px solid ${active ? c.color : "#E7E9E2"}`,
+                        background: active ? c.color + "1A" : T.bg,
+                        color: active ? c.color : T.muted,
+                        border: `1px solid ${active ? c.color : T.line}`,
                         borderRadius: 8, fontSize: 12, fontWeight: 600,
                       }}
                     >
@@ -1146,15 +1873,15 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
             )}
             {form.type === "expense" && (
               <div className="mb-3">
-                <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 6 }}>Who paid?</div>
+                <div style={{ color: T.muted, fontSize: 11, marginBottom: 6 }}>Who paid?</div>
                 <div className="flex gap-1.5 flex-wrap">
                   <button
                     onClick={() => setForm({ ...form, paidBy: "pool" })}
                     className="px-2.5 py-1.5"
                     style={{
-                      background: form.paidBy === "pool" ? "#1F2A1D" : "#F7F8F5",
-                      color: form.paidBy === "pool" ? "#fff" : "#4A5247",
-                      border: `1px solid ${form.paidBy === "pool" ? "#1F2A1D" : "#E7E9E2"}`,
+                      background: form.paidBy === "pool" ? T.ink : T.bg,
+                      color: form.paidBy === "pool" ? "#fff" : T.text2,
+                      border: `1px solid ${form.paidBy === "pool" ? T.ink : T.line}`,
                       borderRadius: 8, fontSize: 12, fontWeight: 600,
                     }}
                   >
@@ -1168,9 +1895,9 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
                         onClick={() => setForm({ ...form, paidBy: m.name })}
                         className="px-2.5 py-1.5"
                         style={{
-                          background: active ? "#4A7FB5" : "#F7F8F5",
-                          color: active ? "#fff" : "#4A5247",
-                          border: `1px solid ${active ? "#4A7FB5" : "#E7E9E2"}`,
+                          background: active ? "#4A7FB5" : T.bg,
+                          color: active ? "#fff" : T.text2,
+                          border: `1px solid ${active ? "#4A7FB5" : T.line}`,
                           borderRadius: 8, fontSize: 12, fontWeight: 600,
                         }}
                       >
@@ -1183,7 +1910,7 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
             )}
             {form.type === "expense" && (
               <div className="mb-3">
-                <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 6 }}>
+                <div style={{ color: T.muted, fontSize: 11, marginBottom: 6 }}>
                   {form.paidBy === "pool"
                     ? "Split with specific housemates? (optional — adds their share to their monthly target)"
                     : `Who does this cover? (they'll owe ${form.paidBy || "the payer"} directly)`}
@@ -1197,9 +1924,9 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
                         onClick={() => toggleSplit(m.id)}
                         className="px-2.5 py-1.5"
                         style={{
-                          background: active ? "#1F2A1D" : "#F7F8F5",
-                          color: active ? "#fff" : "#4A5247",
-                          border: `1px solid ${active ? "#1F2A1D" : "#E7E9E2"}`,
+                          background: active ? T.ink : T.bg,
+                          color: active ? "#fff" : T.text2,
+                          border: `1px solid ${active ? T.ink : T.line}`,
                           borderRadius: 8, fontSize: 12, fontWeight: 600,
                         }}
                       >
@@ -1209,7 +1936,7 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
                   })}
                 </div>
                 {splitWith.length > 0 && Number(form.amount) > 0 && (
-                  <div style={{ color: form.paidBy === "pool" ? "#4C8B5C" : "#4A7FB5", fontSize: 11.5, marginTop: 6, fontWeight: 600 }}>
+                  <div style={{ color: form.paidBy === "pool" ? T.pos : "#4A7FB5", fontSize: 11.5, marginTop: 6, fontWeight: 600 }}>
                     {form.paidBy === "pool"
                       ? `→ ${money(Number(form.amount) / splitWith.length)} added to each of ${splitWith.length} housemate${splitWith.length > 1 ? "s'" : "'s"} target`
                       : `→ each owes ${form.paidBy} ${money(Number(form.amount) / splitWith.length)}`}
@@ -1219,19 +1946,19 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
             )}
             {form.type === "contribution" && (
               <div className="mb-3">
-                <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 6 }}>For</div>
+                <div style={{ color: T.muted, fontSize: 11, marginBottom: 6 }}>For</div>
                 <FieldSelect value={form.person} onChange={e => setForm({ ...form, person: e.target.value })} style={{ marginBottom: 8, width: "100%" }}>
                   {members.map(m => <option key={m.id} value={m.name}>{m.name}</option>)}
                 </FieldSelect>
-                <div style={{ color: "#8A9186", fontSize: 11, marginBottom: 6 }}>Actually paid by (optional — if someone covered it for them)</div>
+                <div style={{ color: T.muted, fontSize: 11, marginBottom: 6 }}>Actually paid by (optional — if someone covered it for them)</div>
                 <div className="flex gap-1.5 flex-wrap">
                   <button
                     onClick={() => setForm({ ...form, contribPaidBy: "" })}
                     className="px-2.5 py-1.5"
                     style={{
-                      background: !form.contribPaidBy ? "#1F2A1D" : "#F7F8F5",
-                      color: !form.contribPaidBy ? "#fff" : "#4A5247",
-                      border: `1px solid ${!form.contribPaidBy ? "#1F2A1D" : "#E7E9E2"}`,
+                      background: !form.contribPaidBy ? T.ink : T.bg,
+                      color: !form.contribPaidBy ? "#fff" : T.text2,
+                      border: `1px solid ${!form.contribPaidBy ? T.ink : T.line}`,
                       borderRadius: 8, fontSize: 12, fontWeight: 600,
                     }}
                   >
@@ -1245,9 +1972,9 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
                         onClick={() => setForm({ ...form, contribPaidBy: m.name })}
                         className="px-2.5 py-1.5"
                         style={{
-                          background: active ? "#4A7FB5" : "#F7F8F5",
-                          color: active ? "#fff" : "#4A5247",
-                          border: `1px solid ${active ? "#4A7FB5" : "#E7E9E2"}`,
+                          background: active ? "#4A7FB5" : T.bg,
+                          color: active ? "#fff" : T.text2,
+                          border: `1px solid ${active ? "#4A7FB5" : T.line}`,
                           borderRadius: 8, fontSize: 12, fontWeight: 600,
                         }}
                       >
@@ -1266,32 +1993,32 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
               <FieldInput type="number" min="0" step="0.01" placeholder="Amount" value={form.amount} onChange={e => setForm({ ...form, amount: e.target.value })} className={form.type === "expense" ? "col-span-2 sm:col-span-1" : "col-span-2 sm:col-span-3"} />
               <FieldInput className="col-span-2 sm:col-span-1" placeholder={form.type === "expense" ? "Note (e.g. Costco run)" : "Note (optional)"} value={form.note} onChange={e => setForm({ ...form, note: e.target.value })} />
-              <button onClick={addTx} className="px-3 py-2" style={{ background: "#1F2A1D", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
+              <button onClick={addTx} className="px-3 py-2" style={{ background: T.pos, color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
                 Log it
               </button>
             </div>
           </div>
           ) : (
-            <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, color: "#8A9186", fontSize: 13 }}>
+            <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginBottom: 20, color: T.muted, fontSize: 13 }}>
               Only the house admin can log contributions and expenses. You can view balances and the ledger below.
             </div>
           )}
 
-          <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Settle up</div>
+          <div style={{ color: T.muted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Settle up</div>
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-7">
             {perPerson.map(m => (
-              <div key={m.id} className="card-hover" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: "12px 14px", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
-                <div style={{ color: "#1F2A1D", fontSize: 14, fontWeight: 600, marginBottom: 6 }}>{m.name}</div>
-                <div style={{ color: "#8A9186", fontSize: 12, marginBottom: 4 }}>{money(m.contributed)} of {money(m.contribution)}</div>
-                <div style={{ background: "#F0F1EC", borderRadius: 6, height: 6, overflow: "hidden" }}>
-                  <div style={{ width: `${m.contribution > 0 ? Math.min(100, (m.contributed / m.contribution) * 100) : 0}%`, background: m.remaining > 0 ? "#C79A3E" : "#4C8B5C", height: "100%" }} />
+              <div key={m.id} className="card-hover" style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: "12px 14px", boxShadow: T.shadow }}>
+                <div style={{ color: T.ink, fontSize: 14, fontWeight: 600, marginBottom: 6 }}>{m.name}</div>
+                <div style={{ color: T.muted, fontSize: 12, marginBottom: 4 }}>{money(m.contributed)} of {money(m.contribution)}</div>
+                <div style={{ background: T.soft, borderRadius: 6, height: 6, overflow: "hidden" }}>
+                  <div style={{ width: `${m.contribution > 0 ? Math.min(100, (m.contributed / m.contribution) * 100) : 0}%`, background: m.remaining > 0 ? T.warn : T.pos, height: "100%" }} />
                 </div>
                 <div className="flex items-center justify-between" style={{ marginTop: 6 }}>
-                  <span style={{ color: m.remaining > 0 ? "#C79A3E" : "#4C8B5C", fontSize: 11.5, fontWeight: 600 }}>
+                  <span style={{ color: m.remaining > 0 ? T.warn : T.pos, fontSize: 11.5, fontWeight: 600 }}>
                     {m.remaining > 0 ? `Owes ${money(m.remaining)}` : "Settled up"}
                   </span>
                   {isAdmin && m.remaining > 0 && (
-                    <button onClick={() => settleUp(m)} className="flex items-center gap-1" style={{ color: "#4C8B5C", fontSize: 11, fontWeight: 600 }}>
+                    <button onClick={() => settleUp(m)} className="flex items-center gap-1" style={{ color: T.pos, fontSize: 11, fontWeight: 600 }}>
                       <HandCoins size={12} /> Settle
                     </button>
                   )}
@@ -1304,19 +2031,19 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
 
       {peerDebts.length > 0 && (
         <>
-          <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Who owes whom</div>
+          <div style={{ color: T.muted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Who owes whom</div>
           <div className="flex flex-col gap-2 mb-7">
             {peerDebts.map((d, i) => (
-              <div key={i} className="card-hover flex items-center gap-3" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 12, padding: "10px 14px", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+              <div key={i} className="card-hover flex items-center gap-3" style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 12, padding: "10px 14px", boxShadow: T.shadow }}>
                 <div style={{ width: 28, height: 28, borderRadius: 8, background: "#4A7FB51A", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                   <HandCoins size={14} color="#4A7FB5" />
                 </div>
-                <div style={{ flex: 1, fontSize: 13, color: "#1F2A1D" }}>
+                <div style={{ flex: 1, fontSize: 13, color: T.ink }}>
                   <span style={{ fontWeight: 700 }}>{d.from}</span> owes <span style={{ fontWeight: 700 }}>{d.to}</span>
                 </div>
                 <div className="font-mono" style={{ color: "#4A7FB5", fontSize: 13.5, fontWeight: 700 }}>{money(d.amount)}</div>
                 {isAdmin && (
-                  <button onClick={() => settlePeerDebt(d)} className="px-2.5 py-1" style={{ background: "#F7F8F5", border: "1px solid #E7E9E2", color: "#4A5247", borderRadius: 7, fontSize: 11, fontWeight: 600 }}>
+                  <button onClick={() => settlePeerDebt(d)} className="px-2.5 py-1" style={{ background: T.bg, border: `1px solid ${T.line}`, color: T.text2, borderRadius: 7, fontSize: 11, fontWeight: 600 }}>
                     Settle
                   </button>
                 )}
@@ -1328,17 +2055,17 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
 
       {spendByCategory.length > 0 && (
         <>
-          <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Spending by category</div>
+          <div style={{ color: T.muted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Spending by category</div>
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-7">
             {spendByCategory.map(c => {
               const Icon = c.icon;
               return (
-                <div key={c.name} className="card-hover" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: "12px 14px", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+                <div key={c.name} className="card-hover" style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: "12px 14px", boxShadow: T.shadow }}>
                   <div style={{ width: 26, height: 26, borderRadius: 7, background: c.color + "1A", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 8 }}>
                     <Icon size={13} color={c.color} />
                   </div>
-                  <div style={{ color: "#8A9186", fontSize: 11 }}>{c.name}</div>
-                  <div className="font-display" style={{ color: "#1F2A1D", fontSize: 15, fontWeight: 700 }}>{money(c.total)}</div>
+                  <div style={{ color: T.muted, fontSize: 11 }}>{c.name}</div>
+                  <div className="font-display" style={{ color: T.ink, fontSize: 15, fontWeight: 700 }}>{money(c.total)}</div>
                 </div>
               );
             })}
@@ -1346,32 +2073,32 @@ function BudgetTab({ members, setMembers, tx, setTx, poolBalance, totalContribut
         </>
       )}
 
-      <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Ledger</div>
+      <div style={{ color: T.muted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Ledger</div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
         {tx.length === 0 && <EmptyState icon={Wallet} text="No entries yet." />}
         {tx.map(t => {
           const cat = (t.type === "expense" || t.type === "peer") ? expCatInfo(t.category || "Other") : null;
           const CatIcon = cat ? cat.icon : ArrowDownRight;
-          const iconColor = t.type === "expense" ? cat.color : t.type === "peer" ? "#4A7FB5" : "#4C8B5C";
+          const iconColor = t.type === "expense" ? cat.color : t.type === "peer" ? "#4A7FB5" : T.pos;
           return (
-            <div key={t.id} className="card-hover flex items-center gap-3" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 12, padding: "10px 12px", boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+            <div key={t.id} className="card-hover flex items-center gap-3" style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 12, padding: "10px 12px", boxShadow: T.shadow }}>
               <div style={{ width: 28, height: 28, borderRadius: 8, background: iconColor + "1A", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                 <CatIcon size={14} color={iconColor} />
               </div>
               <div className="flex-1 min-w-0">
-                <div style={{ color: "#1F2A1D", fontSize: 13, fontWeight: 500 }}>
-                  {t.type === "expense" ? <>Household <span style={{ color: "#8A9186", fontWeight: 400 }}>· {cat.name}</span></>
-                    : t.type === "peer" ? <>{t.payer} paid <span style={{ color: "#8A9186", fontWeight: 400 }}>· {cat?.name}</span></>
+                <div style={{ color: T.ink, fontSize: 13, fontWeight: 500 }}>
+                  {t.type === "expense" ? <>Household <span style={{ color: T.muted, fontWeight: 400 }}>· {cat.name}</span></>
+                    : t.type === "peer" ? <>{t.payer} paid <span style={{ color: T.muted, fontWeight: 400 }}>· {cat?.name}</span></>
                     : `${t.person} contributed`}
                 </div>
-                <div style={{ color: "#B4BAAD", fontSize: 11 }}>
+                <div style={{ color: T.faint, fontSize: 11 }}>
                   {t.note ? `${t.note} · ` : ""}{t.splitWith ? `${t.type === "peer" ? "owed by" : "split with"} ${t.splitWith.join(", ")} · ` : ""}{new Date(t.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
                 </div>
               </div>
-              <div className="font-display" style={{ color: t.type === "expense" ? "#C05C4A" : t.type === "peer" ? "#4A7FB5" : "#4C8B5C", fontSize: 13, fontWeight: 700 }}>
+              <div className="font-display" style={{ color: t.type === "expense" ? T.neg : t.type === "peer" ? "#4A7FB5" : T.pos, fontSize: 13, fontWeight: 700 }}>
                 {t.type === "expense" ? "-" : t.type === "peer" ? "" : "+"}{money(t.amount)}
               </div>
-              <button onClick={() => removeTx(t)} style={{ color: "#C6CBC0", padding: 3, visibility: isAdmin ? "visible" : "hidden" }}>
+              <button onClick={() => removeTx(t)} style={{ color: T.faint, padding: 3, visibility: isAdmin ? "visible" : "hidden" }}>
                 <Trash2 size={12} />
               </button>
             </div>
@@ -1397,51 +2124,51 @@ function HistoryTab({ history }) {
         const balance = rec.totalContributed - rec.totalSpent;
         const open = expanded === rec.id;
         return (
-          <div key={rec.id} style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, boxShadow: "0 2px 8px rgba(31,42,29,0.04)", overflow: "hidden" }}>
+          <div key={rec.id} style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, boxShadow: T.shadow, overflow: "hidden" }}>
             <button
               onClick={() => setExpanded(open ? null : rec.id)}
               className="w-full flex items-center justify-between"
               style={{ padding: "14px 16px" }}
             >
               <div className="text-left">
-                <div className="font-display" style={{ color: "#1F2A1D", fontSize: 15, fontWeight: 700 }}>{rec.label}</div>
-                <div style={{ color: "#8A9186", fontSize: 11.5 }}>{rec.tx.length} entries</div>
+                <div className="font-display" style={{ color: T.ink, fontSize: 15, fontWeight: 700 }}>{rec.label}</div>
+                <div style={{ color: T.muted, fontSize: 11.5 }}>{rec.tx.length} entries</div>
               </div>
               <div className="flex items-center gap-4">
                 <div className="text-right">
-                  <div style={{ color: "#8A9186", fontSize: 10.5 }}>contributed / spent</div>
+                  <div style={{ color: T.muted, fontSize: 10.5 }}>contributed / spent</div>
                   <div className="font-mono" style={{ fontSize: 12.5 }}>
-                    <span style={{ color: "#4C8B5C" }}>{money(rec.totalContributed)}</span>
+                    <span style={{ color: T.pos }}>{money(rec.totalContributed)}</span>
                     {" / "}
-                    <span style={{ color: "#C05C4A" }}>{money(rec.totalSpent)}</span>
+                    <span style={{ color: T.neg }}>{money(rec.totalSpent)}</span>
                   </div>
                 </div>
-                {open ? <ChevronUp size={16} color="#8A9186" /> : <ChevronDown size={16} color="#8A9186" />}
+                {open ? <ChevronUp size={16} color={T.muted} /> : <ChevronDown size={16} color={T.muted} />}
               </div>
             </button>
 
             {open && (
-              <div style={{ borderTop: "1px solid #F0F1EC", padding: "14px 16px" }}>
-                <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Per person</div>
+              <div style={{ borderTop: `1px solid ${T.soft}`, padding: "14px 16px" }}>
+                <div style={{ color: T.muted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Per person</div>
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4">
                   {rec.perPerson.map(p => (
-                    <div key={p.name} style={{ background: "#F7F8F5", borderRadius: 10, padding: "8px 10px" }}>
-                      <div style={{ color: "#1F2A1D", fontSize: 12.5, fontWeight: 600 }}>{p.name}</div>
-                      <div style={{ color: "#8A9186", fontSize: 11 }}>{money(p.contributed)} of {money(p.target)}</div>
+                    <div key={p.name} style={{ background: T.bg, borderRadius: 10, padding: "8px 10px" }}>
+                      <div style={{ color: T.ink, fontSize: 12.5, fontWeight: 600 }}>{p.name}</div>
+                      <div style={{ color: T.muted, fontSize: 11 }}>{money(p.contributed)} of {money(p.target)}</div>
                     </div>
                   ))}
                 </div>
-                <div style={{ color: "#8A9186", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Entries</div>
+                <div style={{ color: T.muted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Entries</div>
                 <div className="flex flex-col gap-1">
                   {rec.tx.map(t => (
-                    <div key={t.id} className="flex items-center justify-between" style={{ fontSize: 12, padding: "5px 0", borderBottom: "1px solid #F5F6F2" }}>
-                      <span style={{ color: "#4A5247" }}>
+                    <div key={t.id} className="flex items-center justify-between" style={{ fontSize: 12, padding: "5px 0", borderBottom: `1px solid ${T.bg}` }}>
+                      <span style={{ color: T.text2 }}>
                         {t.type === "expense" ? `Household · ${t.category || "Other"}`
                           : t.type === "peer" ? `${t.payer} paid for ${(t.splitWith || []).join(", ")}`
                           : `${t.person} contributed`}
-                        {t.note && <span style={{ color: "#B4BAAD" }}> — {t.note}</span>}
+                        {t.note && <span style={{ color: T.faint }}> — {t.note}</span>}
                       </span>
-                      <span className="font-mono" style={{ color: t.type === "expense" ? "#C05C4A" : t.type === "peer" ? "#4A7FB5" : "#4C8B5C", fontWeight: 600 }}>
+                      <span className="font-mono" style={{ color: t.type === "expense" ? T.neg : t.type === "peer" ? "#4A7FB5" : T.pos, fontWeight: 600 }}>
                         {t.type === "expense" ? "-" : t.type === "peer" ? "" : "+"}{money(t.amount)}
                       </span>
                     </div>
@@ -1486,15 +2213,15 @@ function ActivityTab({ activity, canSeeBudget, canSeePeople }) {
       {visible.map(a => {
         const Icon = SCOPE_ICON[a.scope] || ActivityIcon;
         return (
-          <div key={a.id} className="flex items-center gap-3" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 10, padding: "9px 12px" }}>
-            <div style={{ width: 26, height: 26, borderRadius: 8, background: "#F7F8F5", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-              <Icon size={13} color="#8A9186" />
+          <div key={a.id} className="flex items-center gap-3" style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 10, padding: "9px 12px" }}>
+            <div style={{ width: 26, height: 26, borderRadius: 8, background: T.bg, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <Icon size={13} color={T.muted} />
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <span style={{ color: "#1F2A1D", fontWeight: 600 }}>{a.actor}</span>{" "}
-              <span style={{ color: "#4A5247" }}>{a.message}</span>
+              <span style={{ color: T.ink, fontWeight: 600 }}>{a.actor}</span>{" "}
+              <span style={{ color: T.text2 }}>{a.message}</span>
             </div>
-            <div style={{ color: "#B4BAAD", fontSize: 11, whiteSpace: "nowrap" }}>{timeAgo(a.date)}</div>
+            <div style={{ color: T.faint, fontSize: 11, whiteSpace: "nowrap" }}>{timeAgo(a.date)}</div>
           </div>
         );
       })}
@@ -1506,18 +2233,18 @@ function ActivityTab({ activity, canSeeBudget, canSeePeople }) {
 
 function GuideSection({ title, icon: Icon, color, items }) {
   return (
-    <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 12, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+    <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginBottom: 12, boxShadow: T.shadow }}>
       <div className="flex items-center gap-2 mb-3">
         <div style={{ width: 26, height: 26, borderRadius: 8, background: color + "1A", display: "flex", alignItems: "center", justifyContent: "center" }}>
           <Icon size={13} color={color} />
         </div>
-        <div style={{ color: "#1F2A1D", fontSize: 14, fontWeight: 700 }}>{title}</div>
+        <div style={{ color: T.ink, fontSize: 14, fontWeight: 700 }}>{title}</div>
       </div>
       <div className="flex flex-col gap-2">
         {items.map((item, i) => (
           <div key={i} style={{ fontSize: 12.5, lineHeight: 1.5 }}>
-            <span style={{ color: "#1F2A1D", fontWeight: 600 }}>{item.t}</span>{" "}
-            <span style={{ color: "#4A5247" }}>{item.d}</span>
+            <span style={{ color: T.ink, fontWeight: 600 }}>{item.t}</span>{" "}
+            <span style={{ color: T.text2 }}>{item.d}</span>
           </div>
         ))}
       </div>
@@ -1536,7 +2263,7 @@ function HelpTab({ isAdmin }) {
       ],
     },
     {
-      title: "Pantry & Shopping", icon: Package, color: "#4C8B5C",
+      title: "Pantry & Shopping", icon: Package, color: T.pos,
       items: [
         { t: "Add, edit, or remove items", d: "with the pencil and trash icons — only admin can do this; housemates can only adjust quantities." },
         { t: "Set a low-stock threshold", d: "per item so it shows up under Running Low and on the Shopping list automatically." },
@@ -1544,21 +2271,21 @@ function HelpTab({ isAdmin }) {
       ],
     },
     {
-      title: "Money", icon: Wallet, color: "#C79A3E",
+      title: "Money", icon: Wallet, color: T.warn,
       items: [
         { t: "Contribution", d: "logs money going into the shared pool for one person's monthly target." },
         { t: "Expense", d: "logs money leaving the pool — pick a category (Groceries, Rent, Maid, etc)." },
         { t: "\"Who paid?\"", d: "on an expense — leave it as Household pool for normal shared spending, or pick a person if they paid out of their own pocket for others (this creates a debt instead of touching the pool)." },
         { t: "\"Actually paid by\"", d: "on a contribution — use this if one housemate covered another's contribution. The pool credits the covered person, and they owe the payer directly." },
         { t: "Settle up / Who owes whom", d: "one-tap buttons to clear a pool debt or a person-to-person debt once it's paid back in real life." },
-        { t: "Close out a month", d: "archives the current ledger to History and resets — monthly targets carry over, only what's paid resets to $0." },
+        { t: "Close out a month", d: "archives the current ledger to History and resets — monthly targets carry over, only what's paid resets to ₹0." },
       ],
     },
   ];
 
   const memberGuide = [
     {
-      title: "Pantry", icon: Package, color: "#4C8B5C",
+      title: "Pantry", icon: Package, color: T.pos,
       items: [
         { t: "Search or filter by category", d: "to find an item fast." },
         { t: "Use the +/− buttons", d: "to update quantity as things get used up or restocked — that's the one thing you can always do here." },
@@ -1566,7 +2293,7 @@ function HelpTab({ isAdmin }) {
       ],
     },
     {
-      title: "Money (if your admin's given you access)", icon: Wallet, color: "#C79A3E",
+      title: "Money (if your admin's given you access)", icon: Wallet, color: T.warn,
       items: [
         { t: "View-only", d: "you can see pool balance, who owes what, and the full ledger, but only the admin can log new money or delete entries." },
         { t: "Who owes whom", d: "shows any personal debts between housemates, separate from the shared pool." },
@@ -1584,11 +2311,11 @@ function HelpTab({ isAdmin }) {
   return (
     <div>
       <div className="flex items-center gap-2 mb-1">
-        <span style={{ background: isAdmin ? "#1F2A1D" : "#EDEFEA", color: isAdmin ? "#F7F8F5" : "#4A5247", fontSize: 11, fontWeight: 700, borderRadius: 7, padding: "3px 8px" }}>
+        <span style={{ background: isAdmin ? T.ink : T.soft, color: isAdmin ? T.bg : T.text2, fontSize: 11, fontWeight: 700, borderRadius: 7, padding: "3px 8px" }}>
           {isAdmin ? "Admin guide" : "Housemate guide"}
         </span>
       </div>
-      <div style={{ color: "#8A9186", fontSize: 12.5, marginBottom: 16 }}>
+      <div style={{ color: T.muted, fontSize: 12.5, marginBottom: 16 }}>
         {isAdmin ? "What you can do as the house admin." : "What you can do as a housemate — ask your admin if you need access to more."}
       </div>
       {(isAdmin ? adminGuide : memberGuide).map((section, i) => (
@@ -1621,29 +2348,31 @@ function PeopleTab({ members, setMembers, tx, isAdmin, permissions, setPermissio
     const current = getPerms(permissions, memberId);
     setPermissions({ ...permissions, [memberId]: { ...current, [key]: !current[key] } });
   };
-  const draftFor = (id) => loginDrafts[id] || credentials.users?.[id] || { username: "", password: "" };
+  const draftFor = (id) => loginDrafts[id] || { username: credentials.users?.[id]?.username || "", password: "" };
   const setDraft = (id, field, value) => setLoginDrafts({ ...loginDrafts, [id]: { ...draftFor(id), [field]: value } });
-  const saveLogin = (id, memberName) => {
+  const saveLogin = async (id, memberName) => {
     const d = draftFor(id);
     if (!d.username?.trim() || !d.password) return;
-    setCredentials({ ...credentials, users: { ...credentials.users, [id]: { username: d.username.trim(), password: d.password } } });
+    const username = d.username.trim();
+    setCredentials({ ...credentials, users: { ...credentials.users, [id]: { username, passwordHash: await hashPassword(username, d.password) } } });
+    setLoginDrafts((prev) => ({ ...prev, [id]: { username, password: "" } }));
     logActivity?.(`set login credentials for ${memberName}`, "people");
   };
 
   return (
     <div>
       {isAdmin ? (
-      <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+      <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginBottom: 20, boxShadow: T.shadow }}>
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
           <FieldInput className="col-span-2 sm:col-span-1" placeholder="Name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
-          <FieldInput type="number" min="0" placeholder="Monthly target ($)" value={form.contribution} onChange={e => setForm({ ...form, contribution: e.target.value })} />
-          <button onClick={addMember} className="px-3 py-2" style={{ background: "#4C8B5C", color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
+          <FieldInput type="number" min="0" placeholder="Monthly target (₹)" value={form.contribution} onChange={e => setForm({ ...form, contribution: e.target.value })} />
+          <button onClick={addMember} className="px-3 py-2" style={{ background: T.pos, color: "#fff", borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
             Add housemate
           </button>
         </div>
       </div>
       ) : (
-        <div style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 16, marginBottom: 20, color: "#8A9186", fontSize: 13 }}>
+        <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginBottom: 20, color: T.muted, fontSize: 13 }}>
           Only the house admin can add housemates or change contribution targets.
         </div>
       )}
@@ -1655,43 +2384,43 @@ function PeopleTab({ members, setMembers, tx, isAdmin, permissions, setPermissio
           const color = AVATAR_COLORS[i % AVATAR_COLORS.length];
           const perms = getPerms(permissions, m.id);
           return (
-            <div key={m.id} className="card-hover" style={{ background: "#FFFFFF", border: "1px solid #E7E9E2", borderRadius: 14, padding: 14, boxShadow: "0 2px 8px rgba(31,42,29,0.04)" }}>
+            <div key={m.id} className="card-hover" style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, padding: 14, boxShadow: T.shadow }}>
               <div className="flex items-center justify-between mb-3">
                 <div style={{ width: 34, height: 34, borderRadius: 10, background: color, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 14 }}>
                   {m.name.charAt(0).toUpperCase()}
                 </div>
                 {isAdmin && (
-                  <button onClick={() => removeMember(m)} style={{ color: "#C6CBC0", padding: 3 }}>
+                  <button onClick={() => removeMember(m)} style={{ color: T.faint, padding: 3 }}>
                     <Trash2 size={13} />
                   </button>
                 )}
               </div>
-              <div style={{ color: "#1F2A1D", fontSize: 14, fontWeight: 600, marginBottom: 8 }}>{m.name}</div>
+              <div style={{ color: T.ink, fontSize: 14, fontWeight: 600, marginBottom: 8 }}>{m.name}</div>
               <div className="flex items-center gap-1.5 mb-2">
-                <label style={{ color: "#8A9186", fontSize: 11 }}>Target</label>
+                <label style={{ color: T.muted, fontSize: 11 }}>Target</label>
                 {isAdmin ? (
                   <FieldInput type="number" min="0" className="w-20" style={{ padding: "4px 8px" }} value={m.contribution} onChange={e => updateTarget(m.id, e.target.value)} />
                 ) : (
-                  <span style={{ color: "#1F2A1D", fontSize: 12, fontWeight: 600 }}>{money(m.contribution)}</span>
+                  <span style={{ color: T.ink, fontSize: 12, fontWeight: 600 }}>{money(m.contribution)}</span>
                 )}
               </div>
-              <div style={{ color: "#8A9186", fontSize: 11.5, marginBottom: isAdmin ? 10 : 0 }}>Paid {money(contributed)}</div>
+              <div style={{ color: T.muted, fontSize: 11.5, marginBottom: isAdmin ? 10 : 0 }}>Paid {money(contributed)}</div>
 
               {isAdmin && (
-                <div className="flex flex-col gap-1.5 pt-2.5 mb-2.5" style={{ borderTop: "1px solid #F0F1EC" }}>
-                  <div style={{ color: "#8A9186", fontSize: 10.5, textTransform: "uppercase", letterSpacing: 0.4 }}>Login</div>
+                <div className="flex flex-col gap-1.5 pt-2.5 mb-2.5" style={{ borderTop: `1px solid ${T.soft}` }}>
+                  <div style={{ color: T.muted, fontSize: 10.5, textTransform: "uppercase", letterSpacing: 0.4 }}>Login</div>
                   <FieldInput placeholder="Username" style={{ padding: "5px 8px", fontSize: 12 }} value={draftFor(m.id).username} onChange={e => setDraft(m.id, "username", e.target.value)} />
                   <div className="flex gap-1.5">
-                    <FieldInput type="password" placeholder="Password" style={{ padding: "5px 8px", fontSize: 12, flex: 1 }} value={draftFor(m.id).password} onChange={e => setDraft(m.id, "password", e.target.value)} />
-                    <button onClick={() => saveLogin(m.id, m.name)} style={{ background: "#1F2A1D", color: "#fff", borderRadius: 7, padding: "0 10px", fontSize: 11.5, fontWeight: 600 }}>Save</button>
+                    <FieldInput type="password" placeholder={credentials.users?.[m.id] ? "New password" : "Password"} style={{ padding: "5px 8px", fontSize: 12, flex: 1 }} value={draftFor(m.id).password} onChange={e => setDraft(m.id, "password", e.target.value)} />
+                    <button onClick={() => saveLogin(m.id, m.name)} style={{ background: T.pos, color: "#fff", borderRadius: 7, padding: "0 10px", fontSize: 11.5, fontWeight: 600 }}>Save</button>
                   </div>
-                  {credentials.users?.[m.id] && <div style={{ color: "#4C8B5C", fontSize: 10.5 }}>Login set ✓</div>}
+                  {credentials.users?.[m.id] && <div style={{ color: T.pos, fontSize: 10.5 }}>Login set ✓</div>}
                 </div>
               )}
 
               {isAdmin && (
-                <div className="flex flex-col gap-1.5 pt-2.5" style={{ borderTop: "1px solid #F0F1EC" }}>
-                  <div style={{ color: "#8A9186", fontSize: 10.5, textTransform: "uppercase", letterSpacing: 0.4 }}>Can see</div>
+                <div className="flex flex-col gap-1.5 pt-2.5" style={{ borderTop: `1px solid ${T.soft}` }}>
+                  <div style={{ color: T.muted, fontSize: 10.5, textTransform: "uppercase", letterSpacing: 0.4 }}>Can see</div>
                   <PermToggle label="Budget" checked={perms.budget} onChange={() => togglePerm(m.id, "budget")} />
                   <PermToggle label="Household" checked={perms.people} onChange={() => togglePerm(m.id, "people")} />
                 </div>
@@ -1706,11 +2435,11 @@ function PeopleTab({ members, setMembers, tx, isAdmin, permissions, setPermissio
 
 function PermToggle({ label, checked, onChange }) {
   return (
-    <button onClick={onChange} className="flex items-center justify-between" style={{ fontSize: 12, color: "#4A5247" }}>
+    <button onClick={onChange} className="flex items-center justify-between" style={{ fontSize: 12, color: T.text2 }}>
       <span>{label}</span>
       <span
         style={{
-          width: 30, height: 17, borderRadius: 9, background: checked ? "#4C8B5C" : "#E7E9E2",
+          width: 30, height: 17, borderRadius: 9, background: checked ? T.pos : T.line,
           position: "relative", transition: "background .15s ease", flexShrink: 0,
         }}
       >
